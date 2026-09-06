@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the processed feature artifacts used by station and heatmap models."""
+"""Build the processed feature artifacts for the Delhi/Seattle data pipelines."""
 
 from __future__ import annotations
 
@@ -95,16 +95,6 @@ def main() -> None:
             features_dir,
             "--density-vectors",
             f"{features_dir}/delhi_station_density.csv",
-        )
-    )
-    run(
-        py(
-            "-m",
-            "src.pipelines.delhi.prepare_train_test",
-            "--features-csv",
-            f"{features_dir}/delhi_trip_features.csv",
-            "--out-dir",
-            features_dir,
         )
     )
     run(

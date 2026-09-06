@@ -10,7 +10,7 @@ See [seattle-map-architecture.md](./seattle-map-architecture.md) for the cached 
 ## SSE Connection Lifecycle
 
 1. On app mount, open an `EventSource` to `http://localhost:8000/api/heatmap/stream`.
-2. On `config` event: store the grid parameters (bounds, rows, cols). Precompute a lookup from `(row, col)` to `[lon, lat]` cell centroids using the formulas in the API contract. This lookup is static and only rebuilt if a new `config` arrives.
+2. On `config` event: store the grid parameters (bounds, rows, cols). Cell centroids are derived from these using the formulas in the API contract. Frames arriving before a `config` event are discarded.
 3. On `frame` event: convert the sparse cell array into GeoJSON and update the map source.
 4. On `clear` event: set the map source to an empty FeatureCollection.
 5. On component unmount: close the EventSource.
@@ -23,7 +23,7 @@ The stream frame is already the composed display state. The frontend should not 
 
 ## Grid-to-GeoJSON Conversion
 
-Each frame arrives as metadata plus a sparse array of `[row, col, density]` tuples. The frontend converts `cells` to a GeoJSON `FeatureCollection` of **Point** features, one per active cell, positioned at the cell centroid:
+Each frame arrives as metadata plus a sparse array of `[row, col, density]` tuples. `frameToGeoJSON` rasterizes them into a `rows x cols` buffer, then **bilinearly upsamples 3x3 per cell** and emits a GeoJSON `FeatureCollection` of **Point** features — so the feature count is roughly 9x the number of active cells, and grid size carries a real rendering cost:
 
 ```
 Frame input:
@@ -52,7 +52,7 @@ GeoJSON output:
   }
 ```
 
-The `[lon, lat]` for each cell is read from the precomputed centroid lookup (see above). No geometry math happens per-frame, just an array index. The current frontend can ignore `state_version` and `sim_time` until playback controls or scenario status UI need them.
+Both `state_version` and `sim_time` are load-bearing. `state_version` drives a frame-dropping gate that suppresses stale frames after a scenario switch, and `sim_time` feeds the time dial and the train interpolator.
 
 ---
 
@@ -105,7 +105,7 @@ MapLibre heatmap layer (react-map-gl <Layer>)
 
 Scenario state belongs behind the stream, not inside the MapLibre renderer.
 
-When the user adds a station, line, event, or frequency change, the frontend should call a normal HTTP mutation endpoint such as `POST /api/scenarios`. The backend creates a new immutable `state_version`, computes the affected demand deltas from `state_before` to `state_after`, and then the SSE stream starts emitting composed frames for the new state when ready.
+When the user deploys a build-out, the frontend calls `POST /api/scenario` with the scenario id plus the active stops and lines. The backend rebuilds its transit capacity, bumps `state_version`, and returns a freshly composed frame; the SSE stream then continues from the new state. The frontend suppresses stream frames until that response (or a matching `scenario` event) confirms the switch.
 
 For the heatmap layer, the frontend continues doing the same work:
 
@@ -113,7 +113,7 @@ For the heatmap layer, the frontend continues doing the same work:
 receive frame -> convert cells to GeoJSON -> update MapLibre source
 ```
 
-The frontend may later use `state_version` and `sim_time` to show controls, loading states, or compare baseline vs scenario, but those fields are not required for rendering the heatmap.
+`state_version` and `sim_time` are required: see the note on the frame gate above.
 
 ---
 
@@ -121,7 +121,7 @@ The frontend may later use `state_version` and `sim_time` to show controls, load
 
 | Module              | Responsibility                                                        |
 |---------------------|-----------------------------------------------------------------------|
-| `src/heatmap/grid.ts`   | Grid config types, centroid precomputation, frame-to-GeoJSON conversion |
+| `src/heatmap/grid.ts`   | Grid config types, centroid math, 3x3 upsampling, frame-to-GeoJSON conversion |
 | `src/heatmap/stream.ts` | EventSource connection, event parsing, lifecycle management            |
 | `src/heatmap/layer.ts`  | MapLibre heatmap layer style definition                                |
 | `src/App.tsx`            | Wires stream → grid → Source/Layer into the existing Seattle map      |

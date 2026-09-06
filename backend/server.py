@@ -21,7 +21,6 @@ GEOJSON_PATH = Path(
         "seattle/data/processed/seattle_heatmap_grid.geojson",
     )
 )
-DENSITY_PROPERTY = os.environ.get("HEATMAP_DENSITY_PROPERTY", "congestion_score")
 FRAME_INTERVAL_S = float(os.environ.get("HEATMAP_FRAME_INTERVAL", "1.0"))
 SIM_STEP_SECONDS = int(os.environ.get("HEATMAP_SIM_STEP_SECONDS", "1800"))
 
@@ -34,7 +33,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-GRID = load_grid(GEOJSON_PATH, density_property=DENSITY_PROPERTY)
+GRID = load_grid(GEOJSON_PATH)
 STATE = State(
     GRID,
     frame_interval_seconds=FRAME_INTERVAL_S,

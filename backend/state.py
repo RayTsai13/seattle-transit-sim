@@ -6,17 +6,18 @@ import asyncio
 from typing import Any
 
 from .composer import FrameComposer
+from .demand import DemandField
 from .grid import Grid
+from .landuse import build_land_use, cell_centers
 from .network import (
     DEFAULT_SCENARIO_ID,
     VALID_SCENARIO_IDS,
     ActiveNetwork,
-    NetworkInfluence,
+    ServiceCapacity,
     default_network_for_scenario,
     parse_network_payload,
 )
 from .overlays import CrowdOverlay, LiveOverlayManager
-from .seeds import SeedField
 from .sim_time import PlaybackController
 
 
@@ -31,16 +32,18 @@ class State:
         sim_step_seconds: int = 1800,
     ) -> None:
         self.grid = grid
-        self.seed_field = SeedField(grid)
-        self.composer = FrameComposer(seed_field=self.seed_field)
+        self.centers = cell_centers(grid)
+        self.land_use = build_land_use(self.centers)
+        self.demand_field = DemandField(self.land_use)
+        self.composer = FrameComposer(cols=grid.cols)
         self.playback = PlaybackController(
             frame_interval_seconds=frame_interval_seconds,
             sim_step_seconds=sim_step_seconds,
         )
         self.scenario_id: str = DEFAULT_SCENARIO_ID
         self.active_network: ActiveNetwork = default_network_for_scenario(self.scenario_id)
-        self.network_influence = NetworkInfluence(grid, self.active_network)
-        self.overlays = LiveOverlayManager(self.seed_field.centers)
+        self.service = ServiceCapacity(grid, self.active_network)
+        self.overlays = LiveOverlayManager(self.centers)
         self.people = self.overlays.people
         self.scenario_revision: int = 0
         self._version: int = 0
@@ -93,7 +96,7 @@ class State:
             stops_payload=stops,
             lines_payload=lines,
         )
-        self.network_influence = NetworkInfluence(self.grid, self.active_network)
+        self.service = ServiceCapacity(self.grid, self.active_network)
         self.scenario_revision += 1
         self._state_counter += 1
 
@@ -171,7 +174,8 @@ class State:
         return self.composer.compose(
             sim_time=self.playback.current_time,
             state_version=self.state_version,
-            network_influence=self.network_influence,
+            demand_field=self.demand_field,
+            service=self.service,
             overlays=self.overlays,
         ).to_dict()
 

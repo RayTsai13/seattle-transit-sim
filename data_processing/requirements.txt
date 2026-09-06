@@ -1,7 +1,6 @@
 pandas
 requests
 shapely
-scikit-learn
 geopandas
 pyogrio
 fastapi

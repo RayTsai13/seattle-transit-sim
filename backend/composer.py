@@ -1,15 +1,29 @@
-"""Frame composition for the deterministic demand-pressure simulation."""
+"""Frame composition: demand, minus what transit absorbs, is what you see."""
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
 
+from .demand import DemandField
 from .geo import clamp
-from .network import NetworkInfluence
+from .network import ServiceCapacity
 from .overlays import LiveOverlayManager
-from .seeds import SeedField
 from .sim_time import SimTime
+
+
+# Unmet trips/hour in a single cell that reads as full saturation on the map.
+# This is the physical calibration: it fixes what "1.0" means, and it does not
+# move between frames, so building transit visibly cools the city instead of
+# being renormalized away.
+MAX_UNMET_TRIPS_PER_CELL_HOUR = 2400.0
+
+# Cosmetic shaping only. 1.0 is linear; lower values lift the midtones if the
+# map reads too dark. Adjust this, not MAX_UNMET_TRIPS_PER_CELL_HOUR, for looks.
+DENSITY_GAMMA = 0.85
+
+# Cells at or below this display density are omitted from the frame.
+DISPLAY_THRESHOLD = 0.01
 
 
 @dataclass
@@ -32,91 +46,44 @@ class FrameComposer:
     def __init__(
         self,
         *,
-        seed_field: SeedField,
-        display_threshold: float = 0.012,
-        display_gamma: float = 0.72,
+        cols: int,
+        max_unmet_trips: float = MAX_UNMET_TRIPS_PER_CELL_HOUR,
+        gamma: float = DENSITY_GAMMA,
+        display_threshold: float = DISPLAY_THRESHOLD,
     ) -> None:
-        self.seed_field = seed_field
+        self.cols = cols
+        self.max_unmet_trips = max_unmet_trips
+        self.gamma = gamma
         self.display_threshold = display_threshold
-        self.display_gamma = display_gamma
 
     def compose(
         self,
         *,
         sim_time: SimTime,
         state_version: str,
-        network_influence: NetworkInfluence,
+        demand_field: DemandField,
+        service: ServiceCapacity,
         overlays: LiveOverlayManager,
     ) -> HeatmapFrame:
-        base_values = self.seed_field.values_for(sim_time)
-        overlay_values = overlays.values_for(sim_time, network_influence)
-        combined = [
-            max(0.0, base_value + overlay_value)
-            for base_value, overlay_value in zip(base_values, overlay_values)
-        ]
-        network_values = network_influence.apply(combined)
-        cells = self._to_sparse_cells(
-            network_values,
-            display_scale=network_influence.display_scale,
-        )
+        base = demand_field.trips_per_hour(sim_time)
+        crowds = overlays.trips_per_hour(sim_time)
+        demand = [b + c for b, c in zip(base, crowds)]
+
+        served = service.allocate(demand)
+        unmet = [max(0.0, d - s) for d, s in zip(demand, served)]
+
         return HeatmapFrame(
             timestamp=time.time(),
             state_version=state_version,
             sim_time=sim_time,
-            cells=cells,
+            cells=self._to_sparse_cells(unmet),
         )
 
-    def _to_sparse_cells(
-        self,
-        raw_values: list[float],
-        *,
-        display_scale: float = 1.0,
-    ) -> list[list[int | float]]:
-        display_values = normalize_display_values(
-            raw_values,
-            gamma=self.display_gamma,
-        )
-        if display_scale != 1.0:
-            display_values = [clamp(value * display_scale) for value in display_values]
+    def _to_sparse_cells(self, unmet: list[float]) -> list[list[int | float]]:
         cells: list[list[int | float]] = []
-        cols = self.seed_field.grid.cols
-        for idx, density in enumerate(display_values):
+        for idx, trips in enumerate(unmet):
+            density = clamp(trips / self.max_unmet_trips) ** self.gamma
             if density <= self.display_threshold:
                 continue
-            row = idx // cols
-            col = idx % cols
-            cells.append([row, col, round(density, 3)])
+            cells.append([idx // self.cols, idx % self.cols, round(density, 3)])
         return cells
-
-
-def normalize_display_values(raw_values: list[float], *, gamma: float = 0.72) -> list[float]:
-    positives = sorted(value for value in raw_values if value > 0.0)
-    if not positives:
-        return [0.0] * len(raw_values)
-
-    floor = percentile(positives, 0.18) * 0.38
-    p92 = percentile(positives, 0.92)
-    p98 = percentile(positives, 0.98)
-    max_value = positives[-1]
-    ceiling = max(p92 * 1.10, p98 * 0.86, max_value * 0.58, floor + 0.03)
-
-    normalized: list[float] = []
-    for value in raw_values:
-        if value <= floor:
-            normalized.append(0.0)
-            continue
-        scaled = clamp((value - floor) / (ceiling - floor))
-        normalized.append(clamp(scaled ** gamma))
-    return normalized
-
-
-def percentile(sorted_values: list[float], q: float) -> float:
-    if not sorted_values:
-        return 0.0
-    if len(sorted_values) == 1:
-        return sorted_values[0]
-    position = clamp(q) * (len(sorted_values) - 1)
-    lower = int(position)
-    upper = min(len(sorted_values) - 1, lower + 1)
-    fraction = position - lower
-    return sorted_values[lower] * (1.0 - fraction) + sorted_values[upper] * fraction

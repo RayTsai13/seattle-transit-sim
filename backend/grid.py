@@ -1,14 +1,14 @@
-"""Load a heatmap grid from a GeoJSON file.
+"""Load the heatmap grid geometry from a GeoJSON file.
 
 The GeoJSON is expected to be a ``FeatureCollection`` of polygon cells where
-each feature carries:
+each feature carries ``properties.cell_id``: a string of form ``r{row}_c{col}``.
 
-- ``properties.cell_id``: string of form ``r{row}_c{col}`` (zero-padded ints)
-- one or more numeric ``properties.<name>`` fields used as density signals
+Only *geometry* is read: the grid bounds, ``rows``, and ``cols`` are inferred
+from the cell ids and the union of polygon coordinates, so the loader works
+with any rectangular grid without hard-coded geometry.
 
-The grid bounds, ``rows``, and ``cols`` are inferred from the cell ids and the
-union of polygon coordinates, so the loader works with any rectangular grid
-without hard-coded geometry.
+Cell *values* are not read. Demand is generated analytically from the land-use
+model in ``landuse.py`` and ``demand.py``.
 """
 
 from __future__ import annotations
@@ -37,13 +37,15 @@ class Bounds:
         }
 
 
-@dataclass
+@dataclass(frozen=True)
 class Grid:
     bounds: Bounds
     rows: int
     cols: int
-    # Dense rows x cols matrix of floats in [0, 1].
-    density: list[list[float]]
+
+    @property
+    def cell_count(self) -> int:
+        return self.rows * self.cols
 
     def config(self) -> dict:
         """Return the payload sent on the SSE ``config`` event."""
@@ -76,11 +78,8 @@ def _polygon_size(coordinates) -> tuple[float, float]:
     return e - w, n - s
 
 
-def load_grid(
-    path: str | Path,
-    density_property: str = "congestion_score",
-) -> Grid:
-    """Load a grid from a GeoJSON file and normalize density to ``[0, 1]``.
+def load_grid(path: str | Path) -> Grid:
+    """Load grid geometry from a GeoJSON file.
 
     The contract assumes a uniform grid with ``row 0`` at the north edge.
     Real source files (like ``seattle_heatmap_grid.geojson``) sometimes:
@@ -97,8 +96,6 @@ def load_grid(
        canonical size (i.e. partial edge cells).
     3. Detects the source's row orientation and flips it if needed so that
        row ``0`` is the northernmost strip in the returned grid.
-
-    Cells missing the requested property contribute ``0``.
     """
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     features = data.get("features") or []
@@ -152,25 +149,8 @@ def load_grid(
     west = src_west
     east = west + full_cols * cell_w
 
-    density: list[list[float]] = [[0.0] * full_cols for _ in range(full_rows)]
-    raw_max = 0.0
-    for (src_row, src_col), feature in by_cell.items():
-        if src_row >= full_rows or src_col >= full_cols:
-            continue
-        contract_row = src_row if source_row_zero_is_north else (full_rows - 1 - src_row)
-        value = float(feature["properties"].get(density_property) or 0.0)
-        density[contract_row][src_col] = value
-        if value > raw_max:
-            raw_max = value
-
-    if raw_max > 0:
-        for row_values in density:
-            for col_idx in range(full_cols):
-                row_values[col_idx] = row_values[col_idx] / raw_max
-
     return Grid(
         bounds=Bounds(west=west, south=south, east=east, north=north),
         rows=full_rows,
         cols=full_cols,
-        density=density,
     )

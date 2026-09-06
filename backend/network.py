@@ -1,18 +1,35 @@
-"""Active transit network parsing and pressure relief curves."""
+"""Active transit network and the capacity it absorbs.
+
+A stop serves a stated number of trips per hour, per line that calls at it.
+That capacity is handed out to the cells within walking distance, in proportion
+to how much demand each still has unserved. Whatever a stop cannot absorb stays
+on the map as unmet demand.
+
+The consequence, which is the point of the model: the same station cools a quiet
+neighborhood completely and barely dents downtown.
+"""
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any
 
-from .geo import clamp, haversine_m, point_segment_distance_m
+from .geo import haversine_m
 from .grid import Grid
-from .seeds import CellCenter, cell_centers
+from .landuse import CellCenter, cell_centers
 
 
 VALID_SCENARIO_IDS = frozenset({"line-1", "line-1-2", "line-1-2-ballard"})
 DEFAULT_SCENARIO_ID = "line-1"
+
+# Trips per hour a single stop can absorb, per line calling at it. Light rail
+# at ~8 minute headways with 4-car trains is roughly 4,500 boardings/hour per
+# direction; this is deliberately below that, since not every trip in a
+# walkshed is a transit trip.
+STOP_CAPACITY_TRIPS_PER_HOUR = 3000.0
+
+# How far people will walk to reach a stop.
+WALK_RADIUS_M = 900.0
 
 
 @dataclass(frozen=True)
@@ -39,13 +56,6 @@ class ActiveNetwork:
     @property
     def stop_by_id(self) -> dict[str, TransitStop]:
         return {stop.id: stop for stop in self.stops}
-
-
-@dataclass(frozen=True)
-class CellInfluence:
-    relief: float
-    underserved_bonus: float
-    nearest_station_m: float
 
 
 LINE_1_STOPS: tuple[TransitStop, ...] = (
@@ -221,44 +231,67 @@ def parse_network_payload(
     return ActiveNetwork(stops=tuple(stops), lines=tuple(lines))
 
 
-class NetworkInfluence:
-    """Precomputed station and corridor relief for the active network."""
+class ServiceCapacity:
+    """Precomputed walksheds and per-stop capacity for the active network."""
 
     def __init__(self, grid: Grid, network: ActiveNetwork) -> None:
         self.grid = grid
         self.network = network
         self.centers = cell_centers(grid)
-        self._segments = list(_line_segments(network))
         self._line_count_by_stop_id = _line_count_by_stop_id(network)
-        self.systemwide_relief = _systemwide_relief(network)
-        self.influences = [self._influence_for_center(center) for center in self.centers]
+
+        # Per stop: how many trips/hour it absorbs, and which cells it reaches.
+        self.capacity_by_stop_id: dict[str, float] = {}
+        self.walkshed_by_stop_id: dict[str, tuple[int, ...]] = {}
+        for stop in network.stops:
+            lines_serving = max(1, self._line_count_by_stop_id.get(stop.id, 1))
+            self.capacity_by_stop_id[stop.id] = (
+                STOP_CAPACITY_TRIPS_PER_HOUR * lines_serving
+            )
+            self.walkshed_by_stop_id[stop.id] = tuple(
+                idx
+                for idx, center in enumerate(self.centers)
+                if haversine_m(center.lat, center.lon, stop.lat, stop.lon)
+                <= WALK_RADIUS_M
+            )
 
     @property
     def line_count_by_stop_id(self) -> dict[str, int]:
         return dict(self._line_count_by_stop_id)
 
-    def apply(self, values: list[float]) -> list[float]:
-        if not values:
-            return []
-        positive = [value for value in values if value > 0.0]
-        avg_positive = sum(positive) / len(positive) if positive else 0.0
-        output: list[float] = []
-        for value, influence in zip(values, self.influences):
-            local_cooled = value * (1.0 - influence.relief)
-            system_cooled = local_cooled * (1.0 - self.systemwide_relief)
-            bonus = (
-                avg_positive
-                * influence.underserved_bonus
-                * (1.0 - self.systemwide_relief * 0.5)
-            )
-            output.append(max(0.0, system_cooled + bonus))
-        return output
-
     @property
-    def display_scale(self) -> float:
-        return 1.0 - self.systemwide_relief
+    def total_capacity(self) -> float:
+        return sum(self.capacity_by_stop_id.values())
 
-    def nearest_station_distance(self, lat: float, lon: float) -> tuple[float, TransitStop | None]:
+    def allocate(self, demand: list[float]) -> list[float]:
+        """Trips/hour served in each cell.
+
+        Each stop distributes its capacity across its walkshed in proportion to
+        the demand still unserved there, so a cell is never served more trips
+        than it generates, and a cell reached by two stops draws on both.
+        """
+        served = [0.0] * len(demand)
+        for stop in self.network.stops:
+            capacity = self.capacity_by_stop_id.get(stop.id, 0.0)
+            walkshed = self.walkshed_by_stop_id.get(stop.id, ())
+            if capacity <= 0.0 or not walkshed:
+                continue
+
+            remaining = [max(0.0, demand[idx] - served[idx]) for idx in walkshed]
+            total_remaining = sum(remaining)
+            if total_remaining <= 0.0:
+                continue
+
+            share = 1.0 if capacity >= total_remaining else capacity / total_remaining
+            for idx, unserved in zip(walkshed, remaining):
+                served[idx] += unserved * share
+        return served
+
+    def nearest_station_distance(
+        self,
+        lat: float,
+        lon: float,
+    ) -> tuple[float, TransitStop | None]:
         nearest_distance = float("inf")
         nearest_stop: TransitStop | None = None
         for stop in self.network.stops:
@@ -267,59 +300,6 @@ class NetworkInfluence:
                 nearest_distance = distance
                 nearest_stop = stop
         return nearest_distance, nearest_stop
-
-    def _influence_for_center(self, center: CellCenter) -> CellInfluence:
-        stop_relief = 0.0
-        nearest_station_m = float("inf")
-        for stop in self.network.stops:
-            distance_m = haversine_m(center.lat, center.lon, stop.lat, stop.lon)
-            nearest_station_m = min(nearest_station_m, distance_m)
-            service_count = self._line_count_by_stop_id.get(stop.id, 1)
-            station_throughput = float(max(1, service_count))
-            base_relief = (
-                0.56 * math.exp(-((distance_m / 620.0) ** 2))
-                + 0.18 * math.exp(-((distance_m / 1350.0) ** 2))
-            )
-            throughput_bonus = (
-                0.04
-                * max(0, service_count - 1)
-                * math.exp(-((distance_m / 480.0) ** 2))
-            )
-            local_relief = base_relief * station_throughput + throughput_bonus
-            local_cap = min(0.9, 0.72 + 0.12 * max(0, service_count - 1))
-            stop_relief = _combine_probability(stop_relief, min(local_cap, local_relief))
-
-        line_relief = 0.0
-        nearest_line_m = float("inf")
-        for a, b in self._segments:
-            distance_m, _ = point_segment_distance_m(
-                center.lat,
-                center.lon,
-                a.lat,
-                a.lon,
-                b.lat,
-                b.lon,
-            )
-            nearest_line_m = min(nearest_line_m, distance_m)
-            local_relief = 0.30 * math.exp(-((distance_m / 980.0) ** 2))
-            line_relief = _combine_probability(line_relief, min(0.32, local_relief))
-
-        relief = min(0.84, _combine_probability(stop_relief, line_relief))
-
-        far_station = _smoothstep(1200.0, 3100.0, nearest_station_m)
-        far_line = _smoothstep(1000.0, 2600.0, nearest_line_m)
-        underserved_bonus = 0.16 * far_station * far_line
-        return CellInfluence(
-            relief=relief,
-            underserved_bonus=underserved_bonus,
-            nearest_station_m=nearest_station_m,
-        )
-
-
-@dataclass(frozen=True)
-class _SegmentPoint:
-    lat: float
-    lon: float
 
 
 def _line_from_stop_ids(
@@ -351,34 +331,9 @@ def _path_from_payload(raw_path: Any) -> tuple[tuple[float, float], ...]:
     return tuple(path)
 
 
-def _line_segments(network: ActiveNetwork):
-    for line in network.lines:
-        for idx in range(len(line.path) - 1):
-            lon_a, lat_a = line.path[idx]
-            lon_b, lat_b = line.path[idx + 1]
-            yield _SegmentPoint(lat=lat_a, lon=lon_a), _SegmentPoint(lat=lat_b, lon=lon_b)
-
-
 def _line_count_by_stop_id(network: ActiveNetwork) -> dict[str, int]:
     line_count_by_stop: dict[str, int] = {}
     for line in network.lines:
         for stop_id in line.stop_ids:
             line_count_by_stop[stop_id] = line_count_by_stop.get(stop_id, 0) + 1
     return line_count_by_stop
-
-
-def _systemwide_relief(network: ActiveNetwork) -> float:
-    extra_lines = max(0, len(network.lines) - 1)
-    extra_stops = max(0, len(network.stops) - len(LINE_1_STOPS))
-    return min(0.26, 0.075 * extra_lines + 0.006 * extra_stops)
-
-
-def _combine_probability(current: float, next_value: float) -> float:
-    return 1.0 - (1.0 - clamp(current)) * (1.0 - clamp(next_value))
-
-
-def _smoothstep(edge0: float, edge1: float, value: float) -> float:
-    if edge1 <= edge0:
-        return 0.0
-    x = clamp((value - edge0) / (edge1 - edge0))
-    return x * x * (3.0 - 2.0 * x)

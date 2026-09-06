@@ -1,5 +1,13 @@
 # Data Pipeline Architecture and Dispersion Model Plan
 
+> **Historical design record.** The model pipeline described below has been
+> removed from the repository: `src/models/`, `src/pipelines/delhi/prepare_train_test.py`,
+> `scripts/train_models.py`, `scripts/build_line_weights.py`, and
+> `scripts/test_scenarios.py` no longer exist, and `scikit-learn` is no longer a
+> dependency. The runtime backend (`backend/`) generates demand analytically from
+> the land-use model in `backend/landuse.py` and never consumed these outputs.
+> This document is kept for the reasoning and feature definitions it captures.
+
 This document describes the current data-processing architecture for training a city-generic relative demand heatmap from Delhi Metro passenger-per-train data, then applying that learned behavior to station vectors and GTFS supply from other cities such as Seattle.
 
 The repository now contains both the reusable station-vector foundation and a Delhi-weak-supervised demand heatmap path. The older Seattle-only heatmap baseline and passenger-flow timelapse scorer remain available as proxy models.
@@ -32,36 +40,25 @@ data_processing/
         build_gtfs_frequency.py
         build_heatmap_training_dataset.py
         transform_metro.py
-        prepare_train_test.py
       seattle/
         build_station_vectors.py
         build_heatmap_dataset.py
-    models/
-      train_demand_heatmap_model.py
-      train_heatmap_model.py
-      train_heatmap_timelapse_model.py
   scripts/
     build_features.py
     download_raw_data.py
     download_raw_data.sh
     filter_gtfs_station_data.py
-    test_scenarios.py
-    train_models.py
   curr_data/
     raw/
     processed/
       features/
-      model_outputs/
-      scenarios/
 ```
 
-Pipeline defaults point at `curr_data/raw` and the staged `curr_data/processed` tree. `features/` holds reusable feature artifacts, `model_outputs/` holds metrics and scored outputs, and `scenarios/` holds generated scenario overlays. Use `scripts/download_raw_data.py` to populate the raw cache before running pipeline modules. `scripts/download_raw_data.sh` is only a thin compatibility wrapper. Delhi GTFS is optional and can be supplied via `--delhi-gtfs-url` or `--kaggle-delhi-gtfs-dataset`; if omitted, the Delhi frequency builder emits zero-frequency fallback rows.
+Pipeline defaults point at `curr_data/raw` and the staged `curr_data/processed` tree. `features/` holds reusable feature artifacts. Use `scripts/download_raw_data.py` to populate the raw cache before running pipeline modules. `scripts/download_raw_data.sh` is only a thin compatibility wrapper. Delhi GTFS is optional and can be supplied via `--delhi-gtfs-url` or `--kaggle-delhi-gtfs-dataset`; if omitted, the Delhi frequency builder emits zero-frequency fallback rows.
 
 The Puget Sound GTFS feed is multimodal, so station-only work should first run `scripts/filter_gtfs_station_data.py`. It writes `gtfs_stations/` from raw `gtfs/`, keeping `route_type` 0, 1, and 2 plus Sound Transit `agency_id` 40. This excludes buses, ferries, Seattle Streetcar, Seattle Center Monorail, and Amtrak rows. Raw `gtfs/` remains the immutable source cache.
 
-For repeatable local runs, `scripts/build_features.py`, `scripts/train_models.py`, and `scripts/test_scenarios.py` orchestrate the common build, training, and scenario smoke-test commands.
-
-`scripts/build_line_weights.py` supports proposed-line analysis from an ordered station-coordinate CSV. It creates grid-level corridor weights and helper scenario overlays from planned station coordinates, without requiring a full GTFS feed for the proposed line. By default it rebuilds the scenario candidate table so existing station and frequency exposure fields are recomputed around the new line. The line weights are not just corridor proximity: the script trains the Delhi weak-supervised demand model, scores candidate cells as learned demand potential, lets planned stations inherit nearby learned demand plus residential/office/activity/service context, and gives the line network value from connecting multiple demand nodes plus transfer/junction potential.
+For repeatable local runs, `scripts/build_features.py` orchestrates the common build commands. The training and scenario-scoring wrappers described in earlier revisions have been removed along with the model pipeline.
 
 ## Current Architecture
 

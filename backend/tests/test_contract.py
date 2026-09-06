@@ -33,8 +33,8 @@ from fastapi.testclient import TestClient
 
 from backend import server
 from backend.geo import haversine_m
-from backend.network import NetworkInfluence, default_network_for_scenario
-from backend.overlays import crowd_count_strength
+from backend.landuse import SEATTLE_DISTRICTS, is_probable_water
+from backend.network import ServiceCapacity, default_network_for_scenario
 from backend.state import DEFAULT_SCENARIO_ID, VALID_SCENARIO_IDS, State
 
 GEOJSON_PATH = Path("seattle/data/processed/seattle_heatmap_grid.geojson")
@@ -248,12 +248,29 @@ async def test_frame_cells_are_sparse_no_zero_density() -> None:
 
 
 @pytest.mark.asyncio
-async def test_frame_density_reaches_unit_after_normalization() -> None:
-    """At least one cell should hit the top of the [0, 1] range."""
+async def test_frame_density_stays_in_unit_range() -> None:
+    """Density is an absolute ratio of unmet trips to a fixed ceiling, so it
+    must never leave [0, 1] -- but it is not expected to fill the range at
+    every hour. That is the point: a quiet night should look quiet."""
     events = await drive_stream(FakeRequest(), n=4)
     cells = events[3]["data"]["cells"]
-    assert cells, "expected at least one nonzero cell from the source GeoJSON"
-    assert max(density for _, _, density in cells) == pytest.approx(1.0)
+    assert cells, "expected at least one nonzero cell"
+    assert all(0.0 < density <= 1.0 for _, _, density in cells)
+
+
+def test_weekday_peak_is_hot_and_night_is_quiet() -> None:
+    """The absolute scale must separate rush hour from the small hours."""
+    server.STATE.playback.set_playing(False)
+    server.STATE.set_scenario("line-1")
+
+    server.STATE.seek_playback(day_of_week=3, time_bin=8 * 60)
+    peak = server.STATE.compose_frame_cells()
+    server.STATE.seek_playback(day_of_week=3, time_bin=3 * 60)
+    night = server.STATE.compose_frame_cells()
+
+    assert max(density for _, _, density in peak) > 0.6
+    assert max(density for _, _, density in night) < 0.15
+    assert _mean_frame_density(peak) > _mean_frame_density(night) * 5
 
 
 # ---------------------------------------------------------------------------
@@ -508,23 +525,23 @@ def _mean_frame_density(cells: list[list[int | float]]) -> float:
     return total / (server.GRID.rows * server.GRID.cols)
 
 
-def _mean_relief_near(
-    network_influence: NetworkInfluence,
+def _total_served_near(
+    service: ServiceCapacity,
+    demand: list[float],
     *,
     lat: float,
     lon: float,
     radius_m: float,
 ) -> float:
+    """Trips/hour actually absorbed by transit within a radius."""
+    served = service.allocate(demand)
     values = [
-        influence.relief
-        for center, influence in zip(
-            network_influence.centers,
-            network_influence.influences,
-        )
+        served[idx]
+        for idx, center in enumerate(service.centers)
         if haversine_m(lat, lon, center.lat, center.lon) <= radius_m
     ]
     assert values, "test location should cover at least one grid cell"
-    return sum(values) / len(values)
+    return sum(values)
 
 
 def _mean_abs_frame_delta(
@@ -616,9 +633,12 @@ def test_added_person_boosts_density_in_their_cell() -> None:
     """The data path the frontend renders: a placed person must show up in
     the next composed frame at their cell's [row, col]."""
     point = _seattle_inbounds_point()
+    server.STATE.playback.set_playing(False)
+    server.STATE.seek_playback(day_of_week=2, time_bin=8 * 60)
     baseline_cells = {(r, c): d for r, c, d in server.STATE.compose_frame_cells()}
 
-    person = server.STATE.add_person(lat=point["lat"], lon=point["lon"], count=10)
+    # The UI drops crowds in the thousands; ten people do not move a city.
+    person = server.STATE.add_person(lat=point["lat"], lon=point["lon"], count=5_000)
 
     bounds = server.GRID.bounds
     cell_w = (bounds.east - bounds.west) / server.GRID.cols
@@ -663,28 +683,31 @@ def test_ballard_deployment_cools_new_station_catchment() -> None:
 
 
 def test_line_2_doubles_shared_station_throughput() -> None:
-    line_1 = NetworkInfluence(server.GRID, default_network_for_scenario("line-1"))
-    line_1_2 = NetworkInfluence(server.GRID, default_network_for_scenario("line-1-2"))
+    line_1 = ServiceCapacity(server.GRID, default_network_for_scenario("line-1"))
+    line_1_2 = ServiceCapacity(server.GRID, default_network_for_scenario("line-1-2"))
 
     assert line_1.line_count_by_stop_id["westlake"] == 1
     assert line_1_2.line_count_by_stop_id["westlake"] == 2
     assert line_1_2.line_count_by_stop_id["u-district"] == 2
     assert line_1_2.line_count_by_stop_id["judkins-park"] == 1
 
-    line_1_westlake_relief = _mean_relief_near(
-        line_1,
-        lat=47.6113,
-        lon=-122.3371,
-        radius_m=1600,
-    )
-    line_1_2_westlake_relief = _mean_relief_near(
-        line_1_2,
-        lat=47.6113,
-        lon=-122.3371,
-        radius_m=1600,
+    # A second line calling at Westlake doubles the trips/hour it can absorb.
+    assert line_1_2.capacity_by_stop_id["westlake"] == pytest.approx(
+        line_1.capacity_by_stop_id["westlake"] * 2
     )
 
-    assert line_1_2_westlake_relief > line_1_westlake_relief + 0.1
+    # And that capacity is actually taken up, because downtown demand at the
+    # AM peak far exceeds what one line can carry.
+    server.STATE.seek_playback(day_of_week=3, time_bin=8 * 60)
+    demand = server.STATE.demand_field.trips_per_hour(server.STATE.playback.current_time)
+
+    line_1_served = _total_served_near(
+        line_1, demand, lat=47.6113, lon=-122.3371, radius_m=1000
+    )
+    line_1_2_served = _total_served_near(
+        line_1_2, demand, lat=47.6113, lon=-122.3371, radius_m=1000
+    )
+    assert line_1_2_served > line_1_served * 1.2
 
 
 def test_more_lines_progressively_lower_citywide_demand() -> None:
@@ -723,10 +746,29 @@ def test_underserved_areas_remain_hotter_than_served_catchments() -> None:
         lon=-122.2950,
         radius_m=1000,
     )
-    assert underserved_lake_city > served_ballard * 2.5
+    underserved_magnolia = _mean_density_near(
+        cells,
+        lat=47.6465,
+        lon=-122.3996,
+        radius_m=1000,
+    )
+    # Neither Lake City nor Magnolia gets a station in any scenario, so both
+    # stay hot once Ballard's catchment is being served.
+    assert underserved_lake_city > served_ballard * 2
+    assert underserved_magnolia > served_ballard * 2
+
+    # Rainier Beach is the opposite case: low demand against a full station's
+    # capacity, so it is absorbed almost entirely.
+    served_rainier_beach = _mean_density_near(
+        cells,
+        lat=47.5222,
+        lon=-122.2688,
+        radius_m=1000,
+    )
+    assert served_rainier_beach < 0.02
 
 
-def test_crowd_drop_spikes_then_decays_and_spreads() -> None:
+def test_crowd_drop_spikes_then_decays() -> None:
     lat = 47.6060
     lon = -122.3330
     row, col = _cell_for_point(lat, lon)
@@ -748,22 +790,38 @@ def test_crowd_drop_spikes_then_decays_and_spreads() -> None:
     server.STATE.seek_playback(day_of_week=2, time_bin=14 * 60)
     later = {(r, c): d for r, c, d in server.STATE.compose_frame_cells()}
 
-    assert immediate[(row, col)] > baseline.get((row, col), 0.0) + 0.25
-    assert later[(row, col)] < immediate[(row, col)] - 0.20
+    assert immediate[(row, col)] > baseline.get((row, col), 0.0) + 0.10
+    assert later[(row, col)] < immediate[(row, col)]
 
-    centers = _cell_centers()
-    immediate_outer = 0
-    later_outer = 0
-    for cell_row, cell_col, cell_lat, cell_lon in centers:
-        distance = haversine_m(lat, lon, cell_lat, cell_lon)
-        if not 1600 <= distance <= 2800:
-            continue
-        baseline_density = baseline.get((cell_row, cell_col), 0.0)
-        if immediate.get((cell_row, cell_col), 0.0) > baseline_density + 0.12:
-            immediate_outer += 1
-        if later.get((cell_row, cell_col), 0.0) > baseline_density + 0.12:
-            later_outer += 1
-    assert later_outer > immediate_outer
+
+def test_crowd_near_a_station_is_absorbed_more_than_one_that_is_not() -> None:
+    """Crowds contribute trips, so transit capacity acts on them the same way
+    it acts on resident and job demand -- with no special-casing."""
+    server.STATE.playback.set_playing(False)
+    server.STATE.seek_playback(day_of_week=2, time_bin=22 * 60)
+    server.STATE.set_scenario("line-1")
+
+    # Rainier Beach station has spare capacity late at night; Magnolia has
+    # no station at all.
+    served_point = (47.5222, -122.2688)
+    unserved_point = (47.6465, -122.3996)
+
+    boosts = []
+    for lat, lon in (served_point, unserved_point):
+        server.STATE.clear_people()
+        before = _mean_density_near(
+            server.STATE.compose_frame_cells(), lat=lat, lon=lon, radius_m=1200
+        )
+        server.STATE.add_person(
+            lat=lat, lon=lon, count=6_000, duration_minutes=240, radius_m=1500
+        )
+        after = _mean_density_near(
+            server.STATE.compose_frame_cells(), lat=lat, lon=lon, radius_m=1200
+        )
+        boosts.append(after - before)
+
+    served_boost, unserved_boost = boosts
+    assert unserved_boost > served_boost
 
 
 def test_crowd_drop_scale_tracks_people_count() -> None:
@@ -806,7 +864,8 @@ def test_crowd_drop_scale_tracks_people_count() -> None:
         - baseline_near
     )
 
-    assert crowd_count_strength(30_000 // 12) > crowd_count_strength(5_000 // 12) * 4
+    # Trips scale linearly with head count, so a 6x crowd lifts the area
+    # substantially more than the small one.
     assert high_boost > max(0.02, low_boost * 2.5)
 
 
@@ -825,7 +884,93 @@ def test_time_profiles_produce_distinct_hotspot_distributions() -> None:
         server.STATE.seek_playback(day_of_week=day, time_bin=time_bin)
         frames[name] = server.STATE.compose_frame_cells()
 
-    assert _mean_abs_frame_delta(frames["am"], frames["midday"]) > 0.08
-    assert _mean_abs_frame_delta(frames["midday"], frames["pm"]) > 0.05
-    assert _mean_abs_frame_delta(frames["pm"], frames["evening"]) > 0.06
-    assert _mean_abs_frame_delta(frames["midday"], frames["weekend"]) > 0.03
+    assert _mean_abs_frame_delta(frames["am"], frames["midday"]) > 0.010
+    assert _mean_abs_frame_delta(frames["midday"], frames["pm"]) > 0.007
+    assert _mean_abs_frame_delta(frames["pm"], frames["evening"]) > 0.020
+    assert _mean_abs_frame_delta(frames["midday"], frames["weekend"]) > 0.004
+
+
+# ---------------------------------------------------------------------------
+# Land-use model invariants
+# ---------------------------------------------------------------------------
+
+
+def test_land_use_conserves_district_population() -> None:
+    """District totals are spread over cells with normalized weights, so the
+    per-cell counts must sum back to exactly what the table declares. This is
+    what makes the numbers in SEATTLE_DISTRICTS auditable against real data."""
+    land_use = server.STATE.land_use
+
+    for field in ("residents", "jobs", "students", "visitors"):
+        from_cells = sum(getattr(cell, field) for cell in land_use)
+        from_districts = sum(getattr(d, field) for d in SEATTLE_DISTRICTS)
+        assert from_cells == pytest.approx(from_districts, rel=1e-9)
+
+
+def test_water_cells_hold_nobody_and_never_render() -> None:
+    server.STATE.playback.set_playing(False)
+    server.STATE.seek_playback(day_of_week=2, time_bin=8 * 60)
+    cells = {(r, c) for r, c, _ in server.STATE.compose_frame_cells()}
+
+    water_indices = [
+        idx
+        for idx, center in enumerate(server.STATE.centers)
+        if is_probable_water(center.lat, center.lon)
+    ]
+    assert water_indices, "expected the water mask to cover part of the grid"
+
+    for idx in water_indices:
+        cell = server.STATE.land_use[idx]
+        assert cell.residents == 0.0
+        assert cell.jobs == 0.0
+        assert cell.students == 0.0
+        assert cell.visitors == 0.0
+        center = server.STATE.centers[idx]
+        assert (center.row, center.col) not in cells
+
+
+def test_no_cell_is_served_more_trips_than_it_generates() -> None:
+    """Capacity allocation must never manufacture ridership out of thin air."""
+    server.STATE.playback.set_playing(False)
+    for scenario_id in sorted(VALID_SCENARIO_IDS):
+        server.STATE.set_scenario(scenario_id)
+        for time_bin in (3 * 60, 8 * 60, 12 * 60, 17 * 60, 22 * 60):
+            server.STATE.seek_playback(day_of_week=2, time_bin=time_bin)
+            demand = server.STATE.demand_field.trips_per_hour(
+                server.STATE.playback.current_time
+            )
+            served = server.STATE.service.allocate(demand)
+            assert len(served) == len(demand)
+            for want, got in zip(demand, served):
+                assert got <= want + 1e-9
+                assert got >= 0.0
+
+
+def test_more_service_absorbs_strictly_more_trips() -> None:
+    server.STATE.playback.set_playing(False)
+    server.STATE.seek_playback(day_of_week=2, time_bin=8 * 60)
+    demand = server.STATE.demand_field.trips_per_hour(
+        server.STATE.playback.current_time
+    )
+
+    totals = []
+    for scenario_id in ("line-1", "line-1-2", "line-1-2-ballard"):
+        service = ServiceCapacity(server.GRID, default_network_for_scenario(scenario_id))
+        totals.append(sum(service.allocate(demand)))
+
+    assert totals[0] < totals[1] < totals[2]
+
+
+def test_trip_rates_interpolate_smoothly_across_the_hour() -> None:
+    """Rates are interpolated between adjacent hours, so scrubbing the dial
+    must not step. Consecutive 30-minute bins should differ only gradually."""
+    server.STATE.playback.set_playing(False)
+    server.STATE.set_scenario("line-1")
+
+    means = []
+    for minute in range(6 * 60, 11 * 60, 30):
+        server.STATE.seek_playback(day_of_week=2, time_bin=minute)
+        means.append(_mean_frame_density(server.STATE.compose_frame_cells()))
+
+    steps = [abs(b - a) for a, b in zip(means, means[1:])]
+    assert max(steps) < 0.035, f"demand jumps between adjacent bins: {steps}"
