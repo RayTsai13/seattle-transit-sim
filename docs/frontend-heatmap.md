@@ -9,13 +9,24 @@ See [seattle-map-architecture.md](./seattle-map-architecture.md) for the cached 
 
 ## SSE Connection Lifecycle
 
-1. On app mount, open an `EventSource` to `http://localhost:8000/api/heatmap/stream`.
+1. On app mount, open an `EventSource` to the same-origin path `/api/heatmap/stream`
+   (`src/heatmap/stream.ts`). In dev, Vite proxies `/api` to `http://localhost:8000`;
+   in the container, nginx proxies it to `http://backend:8000`. No absolute API host is
+   ever baked into the bundle.
 2. On `config` event: store the grid parameters (bounds, rows, cols). Cell centroids are derived from these using the formulas in the API contract. Frames arriving before a `config` event are discarded.
 3. On `frame` event: convert the sparse cell array into GeoJSON and update the map source.
 4. On `clear` event: set the map source to an empty FeatureCollection.
 5. On component unmount: close the EventSource.
 
-Reconnection is automatic (built-in `EventSource` behavior). A new `config` event on reconnect re-initializes the grid idempotently.
+Reconnection is automatic (built-in `EventSource` behavior). A new `config` event on
+reconnect re-initializes the grid idempotently **and resets the frame gates**: the
+`state_version` floor and any in-flight scenario gate are cleared. This matters because a
+restarted backend counts `state_version` from zero again -- without the reset every later
+frame would sit below the floor and be dropped forever, freezing the map while the
+connection still reported itself as open.
+
+After three consecutive SSE errors the hook reports `connection: 'failed'`, and the
+loading screen offers a retry rather than spinning indefinitely.
 
 The stream frame is already the composed display state. The frontend should not add scenario deltas to baseline values for the primary heatmap layer. It should render the `cells` array exactly as the backend emits it.
 
@@ -23,7 +34,12 @@ The stream frame is already the composed display state. The frontend should not 
 
 ## Grid-to-GeoJSON Conversion
 
-Each frame arrives as metadata plus a sparse array of `[row, col, density]` tuples. `frameToGeoJSON` rasterizes them into a `rows x cols` buffer, then **bilinearly upsamples 3x3 per cell** and emits a GeoJSON `FeatureCollection` of **Point** features — so the feature count is roughly 9x the number of active cells, and grid size carries a real rendering cost:
+Each frame arrives as metadata plus a sparse array of `[row, col, density]` tuples. `frameToGeoJSON` rasterizes them into a `rows x cols` buffer, then **bilinearly upsamples 3x3 per cell** and emits a GeoJSON `FeatureCollection` of **Point** features — roughly 9x the number of active cells.
+
+Only cells within one step of a non-zero value are visited, since a sample reads its
+8-neighbourhood: cost is proportional to the **active area**, not to the grid size. The
+conversion is also skipped entirely while the heatmap layer is hidden (`renderGeometry`),
+and the last raw frame is kept so re-enabling is instant:
 
 ```
 Frame input:
@@ -122,6 +138,6 @@ receive frame -> convert cells to GeoJSON -> update MapLibre source
 | Module              | Responsibility                                                        |
 |---------------------|-----------------------------------------------------------------------|
 | `src/heatmap/grid.ts`   | Grid config types, centroid math, 3x3 upsampling, frame-to-GeoJSON conversion |
-| `src/heatmap/stream.ts` | EventSource connection, event parsing, lifecycle management            |
+| `src/heatmap/stream.ts` | EventSource connection, event parsing, frame gating, lifecycle management |
 | `src/heatmap/layer.ts`  | MapLibre heatmap layer style definition                                |
 | `src/App.tsx`            | Wires stream → grid → Source/Layer into the existing Seattle map      |

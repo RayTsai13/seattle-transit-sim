@@ -11,12 +11,17 @@ neighborhood completely and barely dents downtown.
 
 from __future__ import annotations
 
+import logging
+import math
 from dataclasses import dataclass
 from typing import Any
 
 from .geo import haversine_m
 from .grid import Grid
 from .landuse import CellCenter, cell_centers
+
+
+logger = logging.getLogger(__name__)
 
 
 VALID_SCENARIO_IDS = frozenset({"line-1", "line-1-2", "line-1-2-ballard"})
@@ -30,6 +35,10 @@ STOP_CAPACITY_TRIPS_PER_HOUR = 3000.0
 
 # How far people will walk to reach a stop.
 WALK_RADIUS_M = 900.0
+
+# Meridional meters per degree of latitude; used only to size the
+# bounding-box prefilter, never for the distance itself.
+_METERS_PER_DEGREE_LAT = 111_320.0
 
 
 @dataclass(frozen=True)
@@ -52,10 +61,6 @@ class TransitLine:
 class ActiveNetwork:
     stops: tuple[TransitStop, ...]
     lines: tuple[TransitLine, ...]
-
-    @property
-    def stop_by_id(self) -> dict[str, TransitStop]:
-        return {stop.id: stop for stop in self.stops}
 
 
 LINE_1_STOPS: tuple[TransitStop, ...] = (
@@ -182,6 +187,14 @@ def parse_network_payload(
     lines_payload: Any = None,
 ) -> ActiveNetwork:
     if not isinstance(stops_payload, list) or not isinstance(lines_payload, list):
+        if stops_payload is not None or lines_payload is not None:
+            logger.warning(
+                "Ignoring custom network for %r: stops and lines must both be "
+                "lists (got %s / %s); falling back to the built-in network.",
+                scenario_id,
+                type(stops_payload).__name__,
+                type(lines_payload).__name__,
+            )
         return default_network_for_scenario(scenario_id)
 
     stops: list[TransitStop] = []
@@ -227,6 +240,13 @@ def parse_network_payload(
         )
 
     if not stops or not lines:
+        logger.warning(
+            "Ignoring custom network for %r: parsed %d usable stop(s) and %d "
+            "usable line(s); falling back to the built-in network.",
+            scenario_id,
+            len(stops),
+            len(lines),
+        )
         return default_network_for_scenario(scenario_id)
     return ActiveNetwork(stops=tuple(stops), lines=tuple(lines))
 
@@ -234,10 +254,18 @@ def parse_network_payload(
 class ServiceCapacity:
     """Precomputed walksheds and per-stop capacity for the active network."""
 
-    def __init__(self, grid: Grid, network: ActiveNetwork) -> None:
+    def __init__(
+        self,
+        grid: Grid,
+        network: ActiveNetwork,
+        *,
+        centers: list[CellCenter] | None = None,
+    ) -> None:
         self.grid = grid
         self.network = network
-        self.centers = cell_centers(grid)
+        # Cell centers are expensive to build and identical for a given grid,
+        # so callers that already hold them (``State``) pass theirs in.
+        self.centers = cell_centers(grid) if centers is None else centers
         self._line_count_by_stop_id = _line_count_by_stop_id(network)
 
         # Per stop: how many trips/hour it absorbs, and which cells it reaches.
@@ -248,20 +276,16 @@ class ServiceCapacity:
             self.capacity_by_stop_id[stop.id] = (
                 STOP_CAPACITY_TRIPS_PER_HOUR * lines_serving
             )
-            self.walkshed_by_stop_id[stop.id] = tuple(
-                idx
-                for idx, center in enumerate(self.centers)
-                if haversine_m(center.lat, center.lon, stop.lat, stop.lon)
-                <= WALK_RADIUS_M
+            self.walkshed_by_stop_id[stop.id] = _cells_within(
+                self.centers,
+                stop.lat,
+                stop.lon,
+                WALK_RADIUS_M,
             )
 
     @property
     def line_count_by_stop_id(self) -> dict[str, int]:
         return dict(self._line_count_by_stop_id)
-
-    @property
-    def total_capacity(self) -> float:
-        return sum(self.capacity_by_stop_id.values())
 
     def allocate(self, demand: list[float]) -> list[float]:
         """Trips/hour served in each cell.
@@ -287,19 +311,31 @@ class ServiceCapacity:
                 served[idx] += unserved * share
         return served
 
-    def nearest_station_distance(
-        self,
-        lat: float,
-        lon: float,
-    ) -> tuple[float, TransitStop | None]:
-        nearest_distance = float("inf")
-        nearest_stop: TransitStop | None = None
-        for stop in self.network.stops:
-            distance = haversine_m(lat, lon, stop.lat, stop.lon)
-            if distance < nearest_distance:
-                nearest_distance = distance
-                nearest_stop = stop
-        return nearest_distance, nearest_stop
+
+def _cells_within(
+    centers: list[CellCenter],
+    lat: float,
+    lon: float,
+    radius_m: float,
+) -> tuple[int, ...]:
+    """Indices of cells whose center is within ``radius_m`` of a point.
+
+    A degree-space bounding box rejects the overwhelming majority of cells
+    before the (comparatively expensive) haversine runs.
+    """
+    lat_span = radius_m / _METERS_PER_DEGREE_LAT
+    cos_lat = max(0.01, math.cos(math.radians(lat)))
+    lon_span = radius_m / (_METERS_PER_DEGREE_LAT * cos_lat)
+    min_lat, max_lat = lat - lat_span, lat + lat_span
+    min_lon, max_lon = lon - lon_span, lon + lon_span
+
+    return tuple(
+        idx
+        for idx, center in enumerate(centers)
+        if min_lat <= center.lat <= max_lat
+        and min_lon <= center.lon <= max_lon
+        and haversine_m(center.lat, center.lon, lat, lon) <= radius_m
+    )
 
 
 def _line_from_stop_ids(

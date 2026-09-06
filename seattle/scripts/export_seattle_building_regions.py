@@ -84,9 +84,8 @@ def fetch_url(url: str, timeout: int = 60) -> bytes:
             "Accept-Encoding": "gzip",
         },
     )
+    # Verified TLS: these endpoints present valid certificates.
     ssl_context = ssl.create_default_context()
-    ssl_context.check_hostname = False
-    ssl_context.verify_mode = ssl.CERT_NONE
     with urlopen(request, timeout=timeout, context=ssl_context) as response:
         payload = response.read()
         if response.headers.get("Content-Encoding") == "gzip" or payload[:2] == b"\x1f\x8b":
@@ -101,7 +100,7 @@ def fetch_json(url: str, timeout: int = 60) -> dict:
 def load_height_lookup(path: Path) -> dict[str, float]:
     lookup: dict[str, float] = {}
     with path.open() as handle:
-        reader = csv.DictReader(handle)
+        reader = csv.DictReader(handle, restval="")
         for row in reader:
             object_id = row.get("footprint_object_id", "").strip()
             height_m_raw = row.get("building_height_m", "").strip()
@@ -141,6 +140,13 @@ def fetch_region_geojson(bounds: dict[str, float], page_size: int) -> dict:
 
     while True:
         payload = fetch_json(build_region_url(bounds, result_offset, page_size))
+        # ArcGIS reports failures as a 200 with an `error` body, which would
+        # otherwise read as "this region legitimately has no buildings".
+        if isinstance(payload.get("error"), dict):
+            error = payload["error"]
+            raise RuntimeError(
+                f"ArcGIS returned an error: {error.get('message', error)}"
+            )
         page_features = payload.get("features") or []
         features.extend(page_features)
 
@@ -152,6 +158,13 @@ def fetch_region_geojson(bounds: dict[str, float], page_size: int) -> dict:
             }
 
         result_offset += len(page_features)
+
+
+def write_json_atomic(path, payload, **dump_kwargs) -> None:
+    """Write via a temp file + rename so a crash cannot truncate the target."""
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, **dump_kwargs))
+    tmp_path.replace(path)
 
 
 def apply_heights(region_geojson: dict, height_lookup: dict[str, float]) -> dict:
@@ -208,15 +221,22 @@ def main() -> None:
         geojson = fetch_region_geojson(bounds, args.result_record_count)
         geojson_with_heights = apply_heights(geojson, height_lookup)
 
+        if not geojson_with_heights["features"]:
+            raise RuntimeError(
+                f"Refusing to overwrite {region_name}: the fetch returned no "
+                "features. These files are checked in and the frontend renders "
+                "them directly, so an empty write would blank the map."
+            )
+
         out_path = out_dir / f"seattle-buildings-{region_name}.geojson"
-        out_path.write_text(json.dumps(geojson_with_heights, separators=(",", ":")))
+        write_json_atomic(out_path, geojson_with_heights, separators=(",", ":"))
 
         summary = summarize(region_name, geojson_with_heights)
         summary["out_path"] = f"/seattle/{out_path.name}"
         summaries.append(summary)
 
     summary_path = out_dir / "seattle-building-regions-summary.json"
-    summary_path.write_text(json.dumps(summaries, indent=2))
+    write_json_atomic(summary_path, summaries, indent=2)
     print(json.dumps({"summary_path": str(summary_path), "regions": summaries}, indent=2))
 
 

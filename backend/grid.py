@@ -43,10 +43,6 @@ class Grid:
     rows: int
     cols: int
 
-    @property
-    def cell_count(self) -> int:
-        return self.rows * self.cols
-
     def config(self) -> dict:
         """Return the payload sent on the SSE ``config`` event."""
         return {

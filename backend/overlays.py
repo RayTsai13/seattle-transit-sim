@@ -27,6 +27,11 @@ from .sim_time import MINUTES_PER_WEEK, SimTime
 CROWD_TRIPS_PER_PERSON_PER_HOUR = 0.6
 
 
+# Meridional meters per degree of latitude; used only to size the bounding-box
+# prefilter, never for the distance itself.
+_METERS_PER_DEGREE_LAT = 111_320.0
+
+
 @dataclass
 class CrowdOverlay:
     id: str
@@ -39,6 +44,10 @@ class CrowdOverlay:
     duration_minutes: int
     radius_m: float
     decay_m: float
+    # (cell index, share of the crowd) pairs summing to 1.0. The blob never
+    # moves or changes shape, so this is computed once at creation rather than
+    # re-deriving a distance to every cell in the grid on every frame.
+    footprint: tuple[tuple[int, float], ...] = ()
 
     def to_public_dict(self, *, include_tuning: bool = False) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -99,6 +108,7 @@ class LiveOverlayManager:
             radius_m=max(250.0, float(resolved_radius)),
             decay_m=max(100.0, float(resolved_decay)),
         )
+        overlay.footprint = _normalized_footprint(self.centers, overlay)
         self.people[overlay.id] = overlay
         return overlay
 
@@ -137,24 +147,45 @@ class LiveOverlayManager:
         if total_trips <= 0.0:
             return
 
-        # Normalized Gaussian, so the crowd contributes exactly `total_trips`
-        # no matter how the blob happens to land on the grid.
-        weights: list[tuple[int, float]] = []
-        total_weight = 0.0
-        for idx, center in enumerate(self.centers):
-            distance_m = haversine_m(overlay.lat, overlay.lon, center.lat, center.lon)
-            if distance_m > overlay.radius_m * 2.0:
-                continue
-            weight = math.exp(-((distance_m / overlay.decay_m) ** 2))
-            if weight <= 1e-6:
-                continue
-            weights.append((idx, weight))
-            total_weight += weight
+        # The footprint is already normalized, so the crowd contributes exactly
+        # `total_trips` no matter how the blob happens to land on the grid.
+        for idx, share in overlay.footprint:
+            values[idx] += total_trips * share
 
-        if total_weight <= 0.0:
-            return
-        for idx, weight in weights:
-            values[idx] += total_trips * (weight / total_weight)
+
+def _normalized_footprint(
+    centers: list[CellCenter],
+    overlay: CrowdOverlay,
+) -> tuple[tuple[int, float], ...]:
+    """Per-cell shares of a crowd's Gaussian blob, summing to 1.0.
+
+    A degree-space bounding box rejects almost every cell before the haversine
+    runs, and the result is reused for the overlay's whole lifetime.
+    """
+    reach_m = overlay.radius_m * 2.0
+    lat_span = reach_m / _METERS_PER_DEGREE_LAT
+    cos_lat = max(0.01, math.cos(math.radians(overlay.lat)))
+    lon_span = reach_m / (_METERS_PER_DEGREE_LAT * cos_lat)
+    min_lat, max_lat = overlay.lat - lat_span, overlay.lat + lat_span
+    min_lon, max_lon = overlay.lon - lon_span, overlay.lon + lon_span
+
+    weights: list[tuple[int, float]] = []
+    total_weight = 0.0
+    for idx, center in enumerate(centers):
+        if not (min_lat <= center.lat <= max_lat and min_lon <= center.lon <= max_lon):
+            continue
+        distance_m = haversine_m(overlay.lat, overlay.lon, center.lat, center.lon)
+        if distance_m > reach_m:
+            continue
+        weight = math.exp(-((distance_m / overlay.decay_m) ** 2))
+        if weight <= 1e-6:
+            continue
+        weights.append((idx, weight))
+        total_weight += weight
+
+    if total_weight <= 0.0:
+        return ()
+    return tuple((idx, weight / total_weight) for idx, weight in weights)
 
 
 def overlay_age_minutes(overlay: CrowdOverlay, sim_time: SimTime) -> int:

@@ -955,3 +955,42 @@
 @keyframes reticle-spin {
   100% { transform: rotate(360deg); }
 }
+
+/* ── Loading screen: unreachable-backend state ───────────────────────────── */
+
+.app-loading-screen.has-error .loading-status {
+  color: rgba(150, 42, 42, 0.92);
+}
+
+.loading-detail {
+  max-width: min(320px, 78vw);
+  margin: 10px 0 0;
+  color: rgba(24, 50, 75, 0.66);
+  font-size: 0.82rem;
+  line-height: 1.45;
+  text-align: center;
+}
+
+.loading-retry {
+  margin-top: 16px;
+  padding: 8px 18px;
+  border: 1px solid rgba(24, 50, 75, 0.22);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.9);
+  color: rgba(24, 50, 75, 0.86);
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+.loading-retry:hover {
+  background: #fff;
+  border-color: rgba(24, 50, 75, 0.4);
+}
+
+.loading-retry:focus-visible {
+  outline: 2px solid rgba(24, 50, 75, 0.55);
+  outline-offset: 2px;
+}

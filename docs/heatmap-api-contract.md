@@ -15,8 +15,12 @@ Two implementations satisfy this contract:
 - `backend/server.py` — the real simulation (land use → demand → transit capacity).
 - `mock/server.py` — a fully synthetic drifting-hotspot generator, no data files.
 
-Both listen on `http://localhost:8000`; the frontend dev server runs on
-`http://localhost:5173` and proxies `/api/*` (see `vite.config.ts`, `nginx.conf`).
+Both listen on `http://localhost:8000`. The frontend never uses an absolute API host: it
+requests the same-origin path `/api/*`, which the Vite dev server (port 5173) and nginx (in
+the container) each proxy to the backend. See `vite.config.ts` and `nginx.conf`.
+
+Both are exercised by the same test suite -- `backend/tests/test_server_parity.py` runs every
+endpoint-level assertion in this document against both apps, so the mock cannot drift.
 
 ---
 
@@ -140,8 +144,21 @@ Cells at or below the display threshold are omitted.
 
 `sim_minutes_per_second × frame_interval_seconds` **must** equal the real
 advance in `minute_of_week` between consecutive playback events. The frontend's
-train interpolator compares the two and hard-resyncs on a mismatch, which makes
-trains visibly snap.
+train interpolator drives its animation from this rate and resyncs when its own
+clock drifts, so a wrong value makes trains run at the wrong speed.
+
+Two consequences for implementors:
+
+- **One producer.** The clock must be advanced by a single process-wide ticker, never from
+  inside a per-connection stream generator — otherwise N open tabs advance it N times per
+  interval and the declared rate is a lie.
+- **Whole minutes.** `minute_of_week` is an integer, so `sim_step_seconds` must be a whole
+  number of minutes. A fractional step reports a rate the clock cannot actually achieve.
+
+`POST /api/playback` with a `sim_minutes_per_second` changes how fast time passes and **must
+not move `sim_time`**: the clock is stored absolutely, not derived from `current_tick ×
+sim_step_seconds`. `current_tick` is a monotonic count of frames played, with no fixed
+relationship to `sim_time`.
 
 ### `clear`
 

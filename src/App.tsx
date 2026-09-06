@@ -52,6 +52,25 @@ const blueLight = new DirectionalLight({
 });
 
 const lightingEffect = new LightingEffect({ ambientLight, blueLight });
+// Stable identities: a fresh array or layer literal on every render makes
+// deck.gl re-diff its effects and re-upload the Space Needle model each frame.
+const deckEffects = [lightingEffect];
+
+const SPACE_NEEDLE_DATA = [{ position: [-122.3493, 47.6205] as [number, number] }];
+const spaceNeedleLayer = new ScenegraphLayer({
+  id: "space-needle-3d-v5",
+  data: SPACE_NEEDLE_DATA,
+  scenegraph: "/seattle/SPACE NEEDLE.glb",
+  getPosition: (d: { position: [number, number] }) => d.position,
+  getOrientation: [0, 0, 90],
+  getScale: [1, 1, 1],
+  sizeScale: 1.2,
+  opacity: 0.6,
+  _lighting: "pbr",
+  parameters: {
+    depthTest: true,
+  },
+});
 
 const initialViewState = {
   longitude: -122.3337,
@@ -147,6 +166,10 @@ const BUILDING_REGIONS: BuildingRegion[] = [
 ];
 
 const CAMERA_BOUNDARY_PADDING_DEGREES = 0.003;
+
+// ~150 m expressed as degrees of latitude; longitude is scaled by cos(lat)
+// at the drop point so the scatter stays circular on the ground.
+const CROWD_SCATTER_RADIUS_DEG = 150 / 111_320;
 
 function mergeBoundsList(boundsList: Bounds[]) {
   const firstBounds = boundsList[0];
@@ -319,13 +342,6 @@ function intersectsBounds(a: Bounds, b: Bounds) {
   );
 }
 
-function mergeFeatureCollections(collections: FeatureCollection<Geometry>[]) {
-  return {
-    type: "FeatureCollection",
-    features: collections.flatMap((collection) => collection.features),
-  } satisfies FeatureCollection<Geometry>;
-}
-
 function sortRegionIds(regionIds: string[]) {
   return [...new Set(regionIds)].sort(
     (left, right) =>
@@ -376,6 +392,7 @@ function formatDemandNumber(value: number) {
 }
 
 function App() {
+  const [isHeatmapVisible, setIsHeatmapVisible] = useState(false);
   const {
     geojson: heatmapData,
     setScenario,
@@ -384,7 +401,8 @@ function App() {
     seekTo,
     addPeople,
     diagnostics: heatmapDiagnostics,
-  } = useHeatmap();
+    retryConnection,
+  } = useHeatmap({ renderGeometry: isHeatmapVisible });
   const showHeatmapDebug = useMemo(
     () => new URLSearchParams(window.location.search).has("debugHeatmap"),
     [],
@@ -392,7 +410,6 @@ function App() {
 
   // Deploy state: index of the highest deployed step (0 = Line 1 only)
   const [deployedIndex, setDeployedIndex] = useState(0);
-  const [isHeatmapVisible, setIsHeatmapVisible] = useState(false);
   const [demandTooltip, setDemandTooltip] = useState<DemandTooltip | null>(
     null,
   );
@@ -409,8 +426,11 @@ function App() {
     REGION_LOAD_ORDER[0],
   );
   const [regionErrors, setRegionErrors] = useState<Record<string, string>>({});
-  const buildings = useMemo(
-    () => mergeFeatureCollections(Object.values(regionCollections)),
+  // Sorted so the render order of the <Source> list is stable as regions
+  // stream in; each keeps its own tiles, so a new region costs only itself.
+  const loadedRegions = useMemo(
+    () =>
+      Object.entries(regionCollections).sort(([a], [b]) => a.localeCompare(b)),
     [regionCollections],
   );
 
@@ -435,6 +455,28 @@ function App() {
   const [viewMode, setViewMode] = useState<"top-down" | "angled">("angled");
   const [isPitchLocked, setIsPitchLocked] = useState(false);
   const isAnimatingView = useRef(false);
+  const viewAnimationTimersRef = useRef<number[]>([]);
+  const clearViewAnimationTimers = useCallback(() => {
+    for (const handle of viewAnimationTimersRef.current) {
+      window.clearTimeout(handle);
+    }
+    viewAnimationTimersRef.current = [];
+  }, []);
+
+  // One place to drop every pending timer when the component goes away.
+  useEffect(
+    () => () => {
+      for (const handle of viewAnimationTimersRef.current) {
+        window.clearTimeout(handle);
+      }
+      viewAnimationTimersRef.current = [];
+      if (hoverTimeoutRef.current !== null) {
+        clearTimeout(hoverTimeoutRef.current);
+        hoverTimeoutRef.current = null;
+      }
+    },
+    [],
+  );
 
   // Crowd drop controls
   const [crowdSize, setCrowdSize] = useState<number>(5000);
@@ -502,20 +544,7 @@ function App() {
   );
   const deckLayers = useMemo(
     () => [
-      new ScenegraphLayer({
-        id: "space-needle-3d-v5",
-        data: [{ position: [-122.3493, 47.6205] }],
-        scenegraph: "/seattle/SPACE NEEDLE.glb",
-        getPosition: (d: { position: [number, number] }) => d.position,
-        getOrientation: [0, 0, 90],
-        getScale: [1, 1, 1],
-        sizeScale: 1.2,
-        opacity: 0.6,
-        _lighting: "pbr",
-        parameters: {
-          depthTest: true,
-        },
-      }),
+      spaceNeedleLayer,
       new ScatterplotLayer({
         id: "train-glow-layer",
         beforeId: "transit-stops-labels",
@@ -647,6 +676,9 @@ function App() {
         }
       })
       .finally(() => {
+        // An aborted run has already been superseded; clearing the active id
+        // here would cancel the replacement request that now owns it.
+        if (controller.signal.aborted) return;
         setActiveRegionId((current) =>
           current === region.id ? null : current,
         );
@@ -655,7 +687,10 @@ function App() {
     return () => {
       controller.abort();
     };
-  }, [activeRegionId, queryBounds]);
+    // Deliberately not keyed on `queryBounds`: this effect does not read it,
+    // and re-running on every pan aborted in-flight downloads of region files
+    // up to 34 MB, so large regions could never finish while the user explored.
+  }, [activeRegionId]);
 
   function updateBuildingsForViewport(map: MapRef) {
     const nextBounds = boundsFromMap(map);
@@ -760,7 +795,14 @@ function App() {
     const edgeX = cx + t * cos;
     const edgeY = cy + t * sin;
 
-    setOffscreenArrow({ x: edgeX, y: edgeY, angle: screenAngleDeg });
+    setOffscreenArrow((current) =>
+      current &&
+      Math.abs(current.x - edgeX) < 0.5 &&
+      Math.abs(current.y - edgeY) < 0.5 &&
+      Math.abs(current.angle - screenAngleDeg) < 0.5
+        ? current
+        : { x: edgeX, y: edgeY, angle: screenAngleDeg },
+    );
   }, [triggerCoords]);
 
   useEffect(() => {
@@ -790,12 +832,20 @@ function App() {
       setIsPitchLocked(false);
       setViewMode("angled");
       isAnimatingView.current = true;
-      setTimeout(() => {
-        mapRef.current?.easeTo({ pitch: 55, duration: 1000 });
-        setTimeout(() => {
-          isAnimatingView.current = false;
-        }, 1100);
-      }, 50);
+      // Tracked so a rapid double-toggle cannot leave an earlier timer to
+      // clear `isAnimatingView` while the newer ease is still running, and so
+      // neither timer survives unmount.
+      clearViewAnimationTimers();
+      viewAnimationTimersRef.current.push(
+        window.setTimeout(() => {
+          mapRef.current?.easeTo({ pitch: 55, duration: 1000 });
+          viewAnimationTimersRef.current.push(
+            window.setTimeout(() => {
+              isAnimatingView.current = false;
+            }, 1100),
+          );
+        }, 50),
+      );
     }
   };
 
@@ -855,11 +905,15 @@ function App() {
         height - DEMAND_TOOLTIP_HEIGHT - DEMAND_TOOLTIP_MARGIN,
       );
 
-      setDemandTooltip({
-        x,
-        y,
-        ...demandMetricsFromDensity(hoveredDensity),
-      });
+      const metrics = demandMetricsFromDensity(hoveredDensity);
+      setDemandTooltip((current) =>
+        current &&
+        current.x === x &&
+        current.y === y &&
+        current.estimatedTripsPerHour === metrics.estimatedTripsPerHour
+          ? current
+          : { x, y, ...metrics },
+      );
     },
     [isHeatmapVisible],
   );
@@ -920,21 +974,35 @@ function App() {
         const dropPoint = [e.clientX, e.clientY] as [number, number];
         const lngLat = mapRef.current.unproject(dropPoint);
 
-        // Scatter the crowd into ~12 distinct clusters within a ~150m radius
-        // 0.0015 degrees lat/lon is roughly 150m.
+        // Scatter the crowd into 12 clusters inside a ~150 m circle.
         const drops = 12;
-        const peoplePerDrop = Math.floor(crowdSize / drops);
+        const basePerDrop = Math.floor(crowdSize / drops);
+        // Integer division loses up to `drops - 1` people; hand the remainder
+        // out so the count actually placed matches the number on the button.
+        let remainder = crowdSize - basePerDrop * drops;
 
         for (let i = 0; i < drops; i++) {
-          const r = Math.random() * 0.0015;
+          // sqrt makes the sample uniform over the disc rather than clustered
+          // at the center, and the longitude offset is divided by cos(lat) so
+          // the footprint is a circle rather than a 1.5:1 ellipse at 47.6 N.
+          const radius = CROWD_SCATTER_RADIUS_DEG * Math.sqrt(Math.random());
           const theta = Math.random() * 2 * Math.PI;
-          const lat = lngLat.lat + r * Math.cos(theta);
-          const lon = lngLat.lng + r * Math.sin(theta);
+          const lat = lngLat.lat + radius * Math.sin(theta);
+          const lon =
+            lngLat.lng +
+            (radius * Math.cos(theta)) /
+              Math.max(0.01, Math.cos((lngLat.lat * Math.PI) / 180));
 
-          addPeople(lat, lon, peoplePerDrop, {
+          const count = basePerDrop + (remainder > 0 ? 1 : 0);
+          if (remainder > 0) remainder -= 1;
+          if (count <= 0) continue;
+
+          addPeople(lat, lon, count, {
             kind: "crowd",
             duration_minutes: 240,
-          }).catch(console.error);
+          }).catch((err: unknown) => {
+            console.warn("[heatmap] failed to place part of a crowd", err);
+          });
         }
       }
     };
@@ -948,18 +1016,31 @@ function App() {
     };
   }, [isDraggingCrowd, crowdSize, addPeople]);
 
+  const backendIsPlayingRef = useRef(backendIsPlaying);
+  useEffect(() => {
+    backendIsPlayingRef.current = backendIsPlaying;
+  }, [backendIsPlaying]);
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.code === "Space") {
-        e.preventDefault();
-        setPlaying(!backendIsPlaying).catch((err) => {
-          console.warn("[heatmap] failed to update playback", err);
-        });
+      if (e.code !== "Space" || e.repeat) return;
+      // Space is the native activation key for buttons and range inputs.
+      const target = e.target as HTMLElement | null;
+      if (
+        target instanceof HTMLElement &&
+        (target.isContentEditable ||
+          ["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(target.tagName))
+      ) {
+        return;
       }
+      e.preventDefault();
+      setPlaying(!backendIsPlayingRef.current).catch((err) => {
+        console.warn("[heatmap] failed to update playback", err);
+      });
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [backendIsPlaying, setPlaying]);
+  }, [setPlaying]);
 
   const formatTime = (minutes: number) => {
     const hours = Math.floor(minutes / 60);
@@ -1033,13 +1114,19 @@ function App() {
   );
   const isAppReady =
     isMapLoaded && initialBuildingRegionLoaded && initialHeatmapStreamLoaded;
-  const loadingStatus = !isMapLoaded
-    ? "Loading map"
-    : !initialBuildingRegionLoaded
-      ? "Loading city model"
-      : !initialHeatmapStreamLoaded
-        ? "Syncing simulator"
-        : "Ready";
+  // The stream retries forever on its own, so without an explicit failure state
+  // an unreachable backend leaves a fully-loaded map hidden behind a spinner.
+  const streamUnreachable =
+    heatmapDiagnostics.connection === "failed" && !initialHeatmapStreamLoaded;
+  const loadingStatus = streamUnreachable
+    ? "Can't reach the simulation server"
+    : !isMapLoaded
+      ? "Loading map"
+      : !initialBuildingRegionLoaded
+        ? "Loading city model"
+        : !initialHeatmapStreamLoaded
+          ? "Syncing simulator"
+          : "Ready";
 
   return (
     <div className={`map-shell ${isAppReady ? "is-ready" : "is-loading"}`}>
@@ -1121,13 +1208,24 @@ function App() {
           </div>
         </div>
 
-        <Source id="official-seattle-buildings" type="geojson" data={buildings}>
-          <Layer beforeId="watername_ocean" {...buildingFillLayer} />
-        </Source>
+        {loadedRegions.map(([regionId, collection]) => (
+          <Source
+            key={regionId}
+            id={`official-seattle-buildings-${regionId}`}
+            type="geojson"
+            data={collection}
+          >
+            <Layer
+              beforeId="watername_ocean"
+              {...buildingFillLayer}
+              id={`official-seattle-buildings-fill-${regionId}`}
+            />
+          </Source>
+        ))}
 
         <DeckGLOverlay
           interleaved={true}
-          effects={[lightingEffect]}
+          effects={deckEffects}
           layers={deckLayers}
         />
 
@@ -1384,19 +1482,39 @@ function App() {
       </div>
 
       <div
-        className={`app-loading-screen ${isAppReady ? "is-complete" : ""}`}
+        className={`app-loading-screen ${isAppReady ? "is-complete" : ""} ${
+          streamUnreachable ? "has-error" : ""
+        }`}
         aria-hidden={isAppReady}
       >
         <div className="app-loading-panel">
           <div className="loading-kicker">Gridlock</div>
           <div className="loading-title">Seattle Transit Sim</div>
           <div className="loading-status">{loadingStatus}</div>
-          <div className="loading-track" aria-hidden="true" />
-          <div className="loading-steps" aria-hidden="true">
-            <span className={isMapLoaded ? "is-done" : ""} />
-            <span className={initialBuildingRegionLoaded ? "is-done" : ""} />
-            <span className={initialHeatmapStreamLoaded ? "is-done" : ""} />
-          </div>
+          {streamUnreachable ? (
+            <>
+              <p className="loading-detail">
+                {heatmapDiagnostics.lastError ??
+                  "The simulation backend is not responding."}
+              </p>
+              <button
+                type="button"
+                className="loading-retry"
+                onClick={retryConnection}
+              >
+                Retry connection
+              </button>
+            </>
+          ) : (
+            <>
+              <div className="loading-track" aria-hidden="true" />
+              <div className="loading-steps" aria-hidden="true">
+                <span className={isMapLoaded ? "is-done" : ""} />
+                <span className={initialBuildingRegionLoaded ? "is-done" : ""} />
+                <span className={initialHeatmapStreamLoaded ? "is-done" : ""} />
+              </div>
+            </>
+          )}
         </div>
       </div>
     </div>

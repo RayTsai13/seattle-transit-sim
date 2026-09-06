@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
+import logging
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -15,16 +20,55 @@ from .grid import load_grid
 from .state import State
 
 
+logger = logging.getLogger(__name__)
+
+# Anchored to the repository root rather than the working directory, so the
+# server and the tests start correctly regardless of where they are launched.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
 GEOJSON_PATH = Path(
     os.environ.get(
         "HEATMAP_GEOJSON",
-        "seattle/data/processed/seattle_heatmap_grid.geojson",
+        str(_REPO_ROOT / "seattle" / "data" / "processed" / "seattle_heatmap_grid.geojson"),
     )
 )
 FRAME_INTERVAL_S = float(os.environ.get("HEATMAP_FRAME_INTERVAL", "1.0"))
 SIM_STEP_SECONDS = int(os.environ.get("HEATMAP_SIM_STEP_SECONDS", "1800"))
 
-app = FastAPI(title="Gridlock - visual demand simulation")
+
+async def _frame_ticker() -> None:
+    """Advance the simulation clock and compose the shared frame.
+
+    This is the single producer. Connections never advance the clock, so the
+    sim runs at the same rate whether one client is watching or twenty. When
+    nobody is connected the clock holds rather than composing frames for an
+    empty room.
+    """
+    while True:
+        await asyncio.sleep(FRAME_INTERVAL_S)
+        try:
+            if STATE.subscriber_count == 0:
+                continue
+            STATE.tick()
+            await STATE.notify_change()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover - defensive; keep the ticker alive
+            logger.exception("Frame ticker iteration failed")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    ticker = asyncio.create_task(_frame_ticker())
+    try:
+        yield
+    finally:
+        ticker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await ticker
+
+
+app = FastAPI(title="Gridlock - visual demand simulation", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,55 +90,63 @@ def _sse(event_id: int, event: str, data: dict[str, Any]) -> str:
 
 
 async def _stream(request: Request):
+    """Emit the handshake, then relay the shared frame as it changes.
+
+    A connection is a pure reader: it never advances the clock and never
+    composes a frame of its own.
+    """
     event_id = 0
-
-    yield _sse(event_id, "config", STATE.grid.config())
-    event_id += 1
-
-    yield _sse(event_id, "scenario", {"scenario_id": STATE.scenario_id})
-    event_id += 1
-    last_scenario = STATE.scenario_id
-    last_scenario_revision = STATE.scenario_revision
-
-    playback_state = STATE.playback_state()
-    yield _sse(event_id, "playback", playback_state)
-    event_id += 1
-    last_playback_state = playback_state
-
-    last_version = STATE.version
-    while True:
-        if await request.is_disconnected():
-            break
-
-        if (
-            STATE.scenario_id != last_scenario
-            or STATE.scenario_revision != last_scenario_revision
-        ):
-            yield _sse(event_id, "scenario", {"scenario_id": STATE.scenario_id})
-            event_id += 1
-            last_scenario = STATE.scenario_id
-            last_scenario_revision = STATE.scenario_revision
-
-        playback_state = STATE.playback_state()
-        if playback_state != last_playback_state:
-            yield _sse(event_id, "playback", playback_state)
-            event_id += 1
-            last_playback_state = playback_state
-
-        yield _sse(event_id, "frame", STATE.compose_frame())
+    STATE.add_subscriber()
+    try:
+        yield _sse(event_id, "config", STATE.grid.config())
         event_id += 1
 
-        STATE.advance_playback()
-        playback_state = STATE.playback_state()
-        if playback_state != last_playback_state:
-            yield _sse(event_id, "playback", playback_state)
-            event_id += 1
-            last_playback_state = playback_state
+        yield _sse(event_id, "scenario", {"scenario_id": STATE.scenario_id})
+        event_id += 1
+        last_scenario = STATE.scenario_id
+        last_scenario_revision = STATE.scenario_revision
 
-        last_version = await STATE.wait_for_change(
-            last_version,
-            timeout=FRAME_INTERVAL_S,
-        )
+        playback_state = STATE.playback_state()
+        yield _sse(event_id, "playback", playback_state)
+        event_id += 1
+        last_playback_state = playback_state
+
+        last_version = STATE.version
+        while True:
+            if await request.is_disconnected():
+                break
+
+            if (
+                STATE.scenario_id != last_scenario
+                or STATE.scenario_revision != last_scenario_revision
+            ):
+                yield _sse(event_id, "scenario", {"scenario_id": STATE.scenario_id})
+                event_id += 1
+                last_scenario = STATE.scenario_id
+                last_scenario_revision = STATE.scenario_revision
+
+            playback_state = STATE.playback_state()
+            if playback_state != last_playback_state:
+                yield _sse(event_id, "playback", playback_state)
+                event_id += 1
+                last_playback_state = playback_state
+
+            yield _sse(event_id, "frame", STATE.current_frame())
+            event_id += 1
+
+            last_version = await STATE.wait_for_change(
+                last_version,
+                timeout=FRAME_INTERVAL_S,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # A dead generator closes the response mid-stream with no explanation;
+        # log it so the cause is recoverable from the server side.
+        logger.exception("Heatmap stream terminated by an unhandled error")
+        raise
+    finally:
+        STATE.remove_subscriber()
 
 
 @app.get("/api/heatmap/stream")
@@ -140,7 +192,7 @@ async def post_scenario(payload: dict[str, Any]):
     await STATE.notify_change()
     return {
         "scenario_id": STATE.scenario_id,
-        "frame": STATE.compose_frame(),
+        "frame": STATE.current_frame(),
     }
 
 

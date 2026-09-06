@@ -13,18 +13,47 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import math
 import random
 import secrets
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-app = FastAPI(title="Gridlock — mock heatmap server")
+async def _frame_ticker() -> None:
+    """The mock's single frame producer, mirroring backend/server.py."""
+    while True:
+        await asyncio.sleep(FRAME_INTERVAL_S)
+        try:
+            if STATE.subscriber_count == 0:
+                continue
+            STATE.tick()
+            await STATE.notify_change()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover - keep the ticker alive
+            pass
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    ticker = asyncio.create_task(_frame_ticker())
+    try:
+        yield
+    finally:
+        ticker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await ticker
+        _shutdown_event().set()
+
+
+app = FastAPI(title="Gridlock — mock heatmap server", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -157,6 +186,28 @@ class Person:
     lat: float
     lon: float
     count: int
+    kind: str = "crowd"
+    duration_minutes: int = 180
+    radius_m: float = 1450.0
+    decay_m: float = 560.0
+
+    def to_public_dict(self, *, include_tuning: bool = False) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "id": self.id,
+            "lat": self.lat,
+            "lon": self.lon,
+            "count": self.count,
+        }
+        if include_tuning:
+            payload.update(
+                {
+                    "kind": self.kind,
+                    "duration_minutes": self.duration_minutes,
+                    "radius_m": self.radius_m,
+                    "decay_m": self.decay_m,
+                }
+            )
+        return payload
 
 
 @dataclass(frozen=True)
@@ -180,6 +231,11 @@ class MockPlaybackController:
     time_bin_minutes: int = TIME_BIN_MINUTES
     current_tick: int = 0
     is_playing: bool = True
+    # The clock is absolute rather than derived from current_tick, so changing
+    # the speed re-scales how fast time passes without moving where it points,
+    # and a seek lands exactly where asked instead of snapping to a step
+    # boundary. Mirrors backend/sim_time.py:PlaybackController.
+    current_second_of_week: int = 0
 
     @property
     def sim_minutes_per_second(self) -> float:
@@ -189,7 +245,7 @@ class MockPlaybackController:
 
     @property
     def current_time(self) -> SimTime:
-        minute_of_week = (self.current_tick * self.sim_step_seconds // 60) % MINUTES_PER_WEEK
+        minute_of_week = (self.current_second_of_week // 60) % MINUTES_PER_WEEK
         minute_of_day = minute_of_week % MINUTES_PER_DAY
         return SimTime(
             day_of_week=minute_of_week // MINUTES_PER_DAY,
@@ -200,6 +256,9 @@ class MockPlaybackController:
     def advance(self) -> SimTime:
         if self.is_playing:
             self.current_tick += 1
+            self.current_second_of_week = (
+                self.current_second_of_week + self.sim_step_seconds
+            ) % (MINUTES_PER_WEEK * 60)
         return self.current_time
 
     def set_playing(self, is_playing: bool) -> None:
@@ -208,7 +267,8 @@ class MockPlaybackController:
     def set_speed(self, sim_minutes_per_second: float) -> None:
         if sim_minutes_per_second <= 0:
             raise ValueError("sim_minutes_per_second must be positive.")
-        self.sim_step_seconds = int(round(sim_minutes_per_second * 60 * self.frame_interval_seconds))
+        minutes_per_frame = sim_minutes_per_second * self.frame_interval_seconds
+        self.sim_step_seconds = max(60, int(round(minutes_per_frame)) * 60)
 
     def seek(
         self,
@@ -221,8 +281,7 @@ class MockPlaybackController:
             if day_of_week is None or time_bin is None:
                 raise ValueError("Provide minute_of_week or both day_of_week and time_bin.")
             minute_of_week = (int(day_of_week) % 7) * MINUTES_PER_DAY + int(time_bin)
-        seconds = (minute_of_week % MINUTES_PER_WEEK) * 60
-        self.current_tick = seconds // self.sim_step_seconds
+        self.current_second_of_week = (int(minute_of_week) % MINUTES_PER_WEEK) * 60
         return self.current_time
 
     def to_dict(self) -> dict[str, object]:
@@ -240,9 +299,42 @@ class MockPlaybackController:
 class MockState:
     def __init__(self) -> None:
         self.scenario_id = DEFAULT_SCENARIO_ID
+        self.scenario_revision = 0
         self.people: dict[str, Person] = {}
+        self.drift = 0.0
         self._version = 0
         self._cond: asyncio.Condition | None = None
+        self._latest_frame: dict | None = None
+        self._subscribers = 0
+
+    @property
+    def subscriber_count(self) -> int:
+        return self._subscribers
+
+    def add_subscriber(self) -> None:
+        self._subscribers += 1
+
+    def remove_subscriber(self) -> None:
+        self._subscribers = max(0, self._subscribers - 1)
+
+    def invalidate_frame(self) -> None:
+        self._latest_frame = None
+
+    def current_frame(self) -> dict:
+        """The frame every connection shares, composed at most once per change."""
+        if self._latest_frame is None:
+            frame = generate_frame(self.drift, self.scenario_id, list(self.people.values()))
+            frame["state_version"] = f"state_v{self._version}"
+            frame["sim_time"] = PLAYBACK.current_time.to_dict()
+            self._latest_frame = frame
+        return self._latest_frame
+
+    def tick(self) -> None:
+        """Advance the mock one frame. The single producer, as in the backend."""
+        PLAYBACK.advance()
+        self.drift += 0.5
+        self.invalidate_frame()
+        self.current_frame()
 
     @property
     def version(self) -> int:
@@ -275,8 +367,20 @@ class MockState:
         if scenario_id not in VALID_SCENARIO_IDS:
             raise ValueError(f"Unknown scenario_id: {scenario_id!r}")
         self.scenario_id = scenario_id
+        self.scenario_revision += 1
+        self.invalidate_frame()
 
-    def add_person(self, lat: float, lon: float, count: int) -> Person:
+    def add_person(
+        self,
+        lat: float,
+        lon: float,
+        count: int,
+        *,
+        kind: str | None = None,
+        duration_minutes: int | None = None,
+        radius_m: float | None = None,
+        decay_m: float | None = None,
+    ) -> Person:
         bounds = GRID_CONFIG["bounds"]
         in_bounds = (
             bounds["west"] <= lon <= bounds["east"]
@@ -284,19 +388,41 @@ class MockState:
         )
         if not in_bounds:
             raise ValueError("lat/lon outside configured grid bounds")
+        resolved_count = max(1, int(count))
+        resolved_radius = (
+            radius_m
+            if radius_m is not None
+            else min(4200.0, max(1450.0, 780.0 + math.sqrt(resolved_count) * 24.0))
+        )
         person = Person(
             id=f"p_{secrets.token_hex(4)}",
             lat=lat,
             lon=lon,
-            count=max(1, int(count)),
+            count=resolved_count,
+            kind=str(kind or "crowd"),
+            duration_minutes=max(
+                30,
+                int(
+                    duration_minutes
+                    if duration_minutes is not None
+                    else (240 if resolved_count >= 10_000 else 180)
+                ),
+            ),
+            radius_m=max(250.0, float(resolved_radius)),
+            decay_m=max(
+                100.0,
+                float(decay_m if decay_m is not None else max(420.0, resolved_radius / 2.6)),
+            ),
         )
         self.people[person.id] = person
+        self.invalidate_frame()
         return person
 
     def remove_person(self, person_id: str) -> None:
         if person_id not in self.people:
             raise KeyError(person_id)
         del self.people[person_id]
+        self.invalidate_frame()
 
     def clear_people(self) -> None:
         self.people.clear()
@@ -313,11 +439,6 @@ def _shutdown_event() -> asyncio.Event:
     if _SHUTDOWN is None:
         _SHUTDOWN = asyncio.Event()
     return _SHUTDOWN
-
-
-@app.on_event("shutdown")
-async def _on_shutdown() -> None:
-    _shutdown_event().set()
 
 
 def _sse(event_id: int, event: str, data: dict) -> str:
@@ -423,8 +544,8 @@ def generate_frame(
 
 async def _stream(request: Request):
     event_id = 0
-    t = 0.0
     shutdown = _shutdown_event()
+    STATE.add_subscriber()
 
     yield _sse(event_id, "config", GRID_CONFIG)
     event_id += 1
@@ -434,6 +555,7 @@ async def _stream(request: Request):
     yield _sse(event_id, "playback", PLAYBACK.to_dict())
     event_id += 1
     last_scenario = STATE.scenario_id
+    last_scenario_revision = STATE.scenario_revision
     last_version = STATE.version
     last_playback_state = PLAYBACK.to_dict()
 
@@ -442,25 +564,23 @@ async def _stream(request: Request):
             if await request.is_disconnected():
                 break
 
-            if STATE.scenario_id != last_scenario:
+            if (
+                STATE.scenario_id != last_scenario
+                or STATE.scenario_revision != last_scenario_revision
+            ):
                 yield _sse(event_id, "scenario", {"scenario_id": STATE.scenario_id})
                 event_id += 1
                 last_scenario = STATE.scenario_id
+                last_scenario_revision = STATE.scenario_revision
 
-            frame = generate_frame(t, STATE.scenario_id, list(STATE.people.values()))
-            frame["state_version"] = f"state_v{STATE.version}"
-            frame["sim_time"] = PLAYBACK.current_time.to_dict()
-            yield _sse(event_id, "frame", frame)
-            event_id += 1
-
-            PLAYBACK.advance()
             playback_state = PLAYBACK.to_dict()
             if playback_state != last_playback_state:
                 yield _sse(event_id, "playback", playback_state)
                 event_id += 1
                 last_playback_state = playback_state
 
-            t += 0.5
+            yield _sse(event_id, "frame", STATE.current_frame())
+            event_id += 1
 
             wait_task = asyncio.create_task(
                 STATE.wait_for_change(last_version, timeout=FRAME_INTERVAL_S),
@@ -476,7 +596,9 @@ async def _stream(request: Request):
                 break
             last_version = wait_task.result()
     except asyncio.CancelledError:
-        pass
+        raise
+    finally:
+        STATE.remove_subscriber()
 
 
 @app.get("/api/heatmap/stream")
@@ -501,10 +623,7 @@ async def post_scenario(payload: dict):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await STATE.notify_change()
-    frame = generate_frame(time.time(), STATE.scenario_id, list(STATE.people.values()))
-    frame["state_version"] = f"state_v{STATE.version}"
-    frame["sim_time"] = PLAYBACK.current_time.to_dict()
-    return {"scenario_id": STATE.scenario_id, "frame": frame}
+    return {"scenario_id": STATE.scenario_id, "frame": STATE.current_frame()}
 
 
 @app.get("/api/playback")
@@ -560,17 +679,24 @@ async def post_people(payload: dict):
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="count must be an integer") from exc
 
+    optional_keys = {"duration_minutes", "radius_m", "kind", "decay_m"}
+    include_tuning = any(key in payload for key in optional_keys)
     try:
-        person = STATE.add_person(lat=lat, lon=lon, count=count)
-    except ValueError as exc:
+        person = STATE.add_person(
+            lat=lat,
+            lon=lon,
+            count=count,
+            kind=str(payload["kind"]) if "kind" in payload else None,
+            duration_minutes=(
+                int(payload["duration_minutes"]) if "duration_minutes" in payload else None
+            ),
+            radius_m=float(payload["radius_m"]) if "radius_m" in payload else None,
+            decay_m=float(payload["decay_m"]) if "decay_m" in payload else None,
+        )
+    except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await STATE.notify_change()
-    return {
-        "id": person.id,
-        "lat": person.lat,
-        "lon": person.lon,
-        "count": person.count,
-    }
+    return person.to_public_dict(include_tuning=include_tuning)
 
 
 @app.delete("/api/people/{person_id}")

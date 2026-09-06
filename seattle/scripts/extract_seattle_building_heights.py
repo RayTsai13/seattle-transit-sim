@@ -74,9 +74,8 @@ def fetch_url(url: str, timeout: int) -> bytes:
             "Accept-Encoding": "gzip",
         },
     )
+    # Verified TLS: these endpoints present valid certificates.
     ssl_context = ssl.create_default_context()
-    ssl_context.check_hostname = False
-    ssl_context.verify_mode = ssl.CERT_NONE
     with urlopen(request, timeout=timeout, context=ssl_context) as response:
         payload = response.read()
         if response.headers.get("Content-Encoding") == "gzip" or payload[:2] == b"\x1f\x8b":

@@ -23,6 +23,7 @@ without the HTTP stack buffering the whole infinite body.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 from collections.abc import Iterator
@@ -35,6 +36,7 @@ from backend import server
 from backend.geo import haversine_m
 from backend.landuse import SEATTLE_DISTRICTS, is_probable_water
 from backend.network import ServiceCapacity, default_network_for_scenario
+from backend.sim_time import MINUTES_PER_DAY, MINUTES_PER_WEEK
 from backend.state import DEFAULT_SCENARIO_ID, VALID_SCENARIO_IDS, State
 
 GEOJSON_PATH = Path("seattle/data/processed/seattle_heatmap_grid.geojson")
@@ -974,3 +976,311 @@ def test_trip_rates_interpolate_smoothly_across_the_hour() -> None:
 
     steps = [abs(b - a) for a, b in zip(means, means[1:])]
     assert max(steps) < 0.035, f"demand jumps between adjacent bins: {steps}"
+
+
+# ---------------------------------------------------------------------------
+# The simulation clock has exactly one producer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_open_streams_never_advance_the_simulation_clock() -> None:
+    """A connection is a reader.
+
+    The clock used to be advanced from inside the per-connection generator, so
+    two open tabs ran the simulation at twice the declared rate -- which also
+    breaks the contract's requirement that ``sim_minutes_per_second x
+    frame_interval_seconds`` equal the real advance in ``minute_of_week``.
+    """
+    server.STATE.playback.seek(day_of_week=2, time_bin=9 * 60)
+    minute_before = server.STATE.playback.current_time.minute_of_week
+    tick_before = server.STATE.playback.current_tick
+
+    await asyncio.gather(
+        drive_stream(FakeRequest(), n=6),
+        drive_stream(FakeRequest(), n=6),
+    )
+
+    assert server.STATE.playback.current_tick == tick_before
+    assert server.STATE.playback.current_time.minute_of_week == minute_before
+
+
+@pytest.mark.asyncio
+async def test_frame_ticker_holds_the_clock_while_nobody_is_connected() -> None:
+    tick_before = server.STATE.playback.current_tick
+    ticker = asyncio.create_task(server._frame_ticker())
+    try:
+        await asyncio.sleep(server.FRAME_INTERVAL_S * 4)
+    finally:
+        ticker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await ticker
+
+    assert server.STATE.subscriber_count == 0
+    assert server.STATE.playback.current_tick == tick_before
+
+
+@pytest.mark.asyncio
+async def test_frame_ticker_advances_the_clock_for_connected_readers() -> None:
+    server.STATE.add_subscriber()
+    tick_before = server.STATE.playback.current_tick
+    ticker = asyncio.create_task(server._frame_ticker())
+    try:
+        await asyncio.sleep(server.FRAME_INTERVAL_S * 4)
+    finally:
+        ticker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await ticker
+        server.STATE.remove_subscriber()
+
+    assert server.STATE.playback.current_tick > tick_before
+
+
+@pytest.mark.asyncio
+async def test_all_readers_share_one_composed_frame() -> None:
+    """Frames are composed once per tick, not once per client."""
+    frame_a = server.STATE.current_frame()
+    frame_b = server.STATE.current_frame()
+    assert frame_a is frame_b
+
+    server.STATE.tick()
+    assert server.STATE.current_frame() is not frame_a
+
+
+# ---------------------------------------------------------------------------
+# Playback speed
+# ---------------------------------------------------------------------------
+
+
+def test_playback_speed_change_preserves_the_clock(client: TestClient) -> None:
+    """Changing speed must re-scale how fast time passes, not where it points."""
+    client.post("/api/playback/seek", json={"day_of_week": 3, "time_bin": 18 * 60})
+    baseline = client.get("/api/playback").json()["sim_time"]["minute_of_week"]
+
+    for speed in (60.0, 5.0, 240.0, 0.5):
+        response = client.post(
+            "/api/playback",
+            json={"sim_minutes_per_second": speed},
+        )
+        assert response.status_code == 200
+        assert response.json()["sim_time"]["minute_of_week"] == baseline
+
+
+def test_playback_declared_rate_matches_the_real_advance(client: TestClient) -> None:
+    """The contract's train interpolator resyncs -- visibly -- on a mismatch."""
+    client.post("/api/playback/seek", json={"day_of_week": 1, "time_bin": 8 * 60})
+
+    for speed in (60.0, 240.0, 0.5):
+        payload = client.post(
+            "/api/playback",
+            json={"sim_minutes_per_second": speed},
+        ).json()
+
+        before = server.STATE.playback.current_time.minute_of_week
+        server.STATE.playback.advance()
+        after = server.STATE.playback.current_time.minute_of_week
+        observed = (after - before) % MINUTES_PER_WEEK
+
+        expected = payload["sim_minutes_per_second"] * payload["frame_interval_seconds"]
+        assert observed == pytest.approx(expected)
+
+
+def test_post_playback_rejects_a_non_positive_speed(client: TestClient) -> None:
+    assert client.post("/api/playback", json={"sim_minutes_per_second": 0}).status_code == 400
+    assert client.post("/api/playback", json={"sim_minutes_per_second": -5}).status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Malformed scenario payloads (the contract requires tolerating these)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "stops, lines",
+    [
+        (None, None),
+        ("not-a-list", "not-a-list"),
+        ([], []),
+        ([{"id": "a", "coordinates": [-122.33, 47.60]}], []),
+        ([{"no_id": True}], [{"id": "l", "stopIds": ["a"]}]),
+        ([{"id": "a", "coordinates": [-122.33]}], [{"id": "l", "stopIds": ["a"]}]),
+        (
+            [{"id": "a", "coordinates": [-122.33, 47.60]}],
+            [{"id": "l", "stopIds": ["a"], "path": [[-122.33, 47.60]]}],
+        ),
+    ],
+)
+def test_parse_network_payload_falls_back_on_malformed_input(stops, lines) -> None:
+    from backend.network import parse_network_payload
+
+    network = parse_network_payload(
+        scenario_id="line-1",
+        stops_payload=stops,
+        lines_payload=lines,
+    )
+    assert network == default_network_for_scenario("line-1")
+
+
+def test_parse_network_payload_derives_a_path_from_stop_ids() -> None:
+    from backend.network import parse_network_payload
+
+    network = parse_network_payload(
+        scenario_id="line-1",
+        stops_payload=[
+            {"id": "a", "coordinates": [-122.33, 47.60], "color": "#fff"},
+            {"id": "b", "coordinates": [-122.34, 47.61], "offset": 2},
+        ],
+        lines_payload=[{"id": "l", "stopIds": ["a", "b"]}],
+    )
+    assert [stop.id for stop in network.stops] == ["a", "b"]
+    assert network.lines[0].path == ((-122.33, 47.60), (-122.34, 47.61))
+
+
+def test_post_scenario_tolerates_malformed_stops_and_lines(client: TestClient) -> None:
+    response = client.post(
+        "/api/scenario",
+        json={"scenario_id": "line-1-2", "stops": "nope", "lines": 17},
+    )
+    assert response.status_code == 200
+    assert response.json()["frame"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Overlay ageing across the week boundary
+# ---------------------------------------------------------------------------
+
+
+def test_overlay_age_wraps_across_the_end_of_the_week() -> None:
+    from backend.overlays import CrowdOverlay, overlay_age_minutes
+    from backend.sim_time import sim_time_for_second
+
+    # Dropped Saturday 23:00, read Sunday 01:00 -- two hours old, not a week.
+    created = 6 * MINUTES_PER_DAY + 23 * 60
+    overlay = CrowdOverlay(
+        id="p_test",
+        kind="crowd",
+        lat=47.6,
+        lon=-122.33,
+        count=100,
+        created_at_real_time=0.0,
+        created_at_minute=created,
+        duration_minutes=240,
+        radius_m=1000.0,
+        decay_m=400.0,
+    )
+    later = sim_time_for_second(60 * 60 * 1)  # Sunday 01:00 of the next week
+    assert overlay_age_minutes(overlay, later) == 120
+
+
+# ---------------------------------------------------------------------------
+# Grid loader edge cases (synthetic sources, not the shipped file)
+# ---------------------------------------------------------------------------
+
+
+def _square_cell(west: float, south: float, size: float) -> dict:
+    east, north = west + size, south + size
+    return {
+        "type": "Polygon",
+        "coordinates": [
+            [[west, south], [east, south], [east, north], [west, north], [west, south]]
+        ],
+    }
+
+
+def _grid_geojson(
+    rows: int,
+    cols: int,
+    *,
+    row_zero_is_north: bool,
+    size: float = 0.01,
+    west: float = -122.5,
+    south: float = 47.5,
+    partial_last_col: bool = False,
+) -> dict:
+    features = []
+    for row in range(rows):
+        for col in range(cols):
+            offset = (rows - 1 - row) if row_zero_is_north else row
+            cell_size = size
+            if partial_last_col and col == cols - 1:
+                cell_size = size / 2
+            features.append(
+                {
+                    "type": "Feature",
+                    "properties": {"cell_id": f"r{row}_c{col}"},
+                    "geometry": _square_cell(
+                        west + col * size,
+                        south + offset * size,
+                        cell_size,
+                    ),
+                }
+            )
+    return {"type": "FeatureCollection", "features": features}
+
+
+def _write_grid(tmp_path: Path, payload: dict) -> Path:
+    path = tmp_path / "grid.geojson"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize("row_zero_is_north", [True, False])
+def test_load_grid_normalizes_row_orientation(
+    tmp_path: Path,
+    row_zero_is_north: bool,
+) -> None:
+    from backend.grid import load_grid
+
+    path = _write_grid(
+        tmp_path,
+        _grid_geojson(3, 2, row_zero_is_north=row_zero_is_north),
+    )
+    grid = load_grid(path)
+
+    assert (grid.rows, grid.cols) == (3, 2)
+    # Row 0 is the northernmost strip regardless of how the source indexed it.
+    assert grid.bounds.north == pytest.approx(47.53)
+    assert grid.bounds.south == pytest.approx(47.50)
+    assert grid.bounds.west == pytest.approx(-122.50)
+    assert grid.bounds.east == pytest.approx(-122.48)
+
+
+def test_load_grid_drops_partial_edge_columns(tmp_path: Path) -> None:
+    from backend.grid import load_grid
+
+    path = _write_grid(
+        tmp_path,
+        _grid_geojson(3, 3, row_zero_is_north=True, partial_last_col=True),
+    )
+    grid = load_grid(path)
+    assert (grid.rows, grid.cols) == (3, 2)
+
+
+def test_load_grid_rejects_an_empty_feature_collection(tmp_path: Path) -> None:
+    from backend.grid import load_grid
+
+    path = _write_grid(tmp_path, {"type": "FeatureCollection", "features": []})
+    with pytest.raises(ValueError, match="No features"):
+        load_grid(path)
+
+
+def test_load_grid_rejects_a_source_missing_cell_zero(tmp_path: Path) -> None:
+    from backend.grid import load_grid
+
+    payload = _grid_geojson(3, 2, row_zero_is_north=True)
+    payload["features"] = [
+        f for f in payload["features"] if f["properties"]["cell_id"] != "r0_c0"
+    ]
+    path = _write_grid(tmp_path, payload)
+    with pytest.raises(ValueError, match="missing cell"):
+        load_grid(path)
+
+
+def test_load_grid_rejects_a_malformed_cell_id(tmp_path: Path) -> None:
+    from backend.grid import load_grid
+
+    payload = _grid_geojson(2, 2, row_zero_is_north=True)
+    payload["features"][0]["properties"]["cell_id"] = "not-a-cell"
+    path = _write_grid(tmp_path, payload)
+    with pytest.raises(ValueError, match="Unexpected cell_id"):
+        load_grid(path)

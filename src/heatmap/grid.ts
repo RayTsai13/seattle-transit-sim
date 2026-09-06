@@ -32,26 +32,6 @@ export type SimTime = {
 const HEATMAP_SUBDIVISIONS = 3;
 const MIN_RENDER_DENSITY = 0.006;
 
-/**
- * Precompute a flat array of [lon, lat] pairs for every (row, col).
- * Index formula: (row * cols + col) * 2 → lon, +1 → lat.
- */
-export function buildCentroidLookup(config: GridConfig): Float64Array {
-  const { bounds, rows, cols } = config;
-  const cellWidth = (bounds.east - bounds.west) / cols;
-  const cellHeight = (bounds.north - bounds.south) / rows;
-  const lookup = new Float64Array(rows * cols * 2);
-
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const idx = (r * cols + c) * 2;
-      lookup[idx] = bounds.west + (c + 0.5) * cellWidth;
-      lookup[idx + 1] = bounds.north - (r + 0.5) * cellHeight;
-    }
-  }
-  return lookup;
-}
-
 export function frameToGeoJSON(
   cells: CellTuple[],
   config: GridConfig,
@@ -68,31 +48,52 @@ export function frameToGeoJSON(
 
   const features: FeatureCollection<Point>['features'] = [];
 
-  for (let row = 0; row < rows; row++) {
-    for (let col = 0; col < cols; col++) {
-      for (let sampleY = 0; sampleY < HEATMAP_SUBDIVISIONS; sampleY++) {
-        const y = (sampleY + 0.5) / HEATMAP_SUBDIVISIONS;
-        const rowCoord = row + y - 0.5;
+  // Frames are sparse, but every sample of a cell reads its 8-neighbourhood
+  // (the subdivision offsets span +/- half a cell), so a cell can only produce
+  // output if something within one step of it is non-zero. Visiting just that
+  // dilated set keeps the cost proportional to the active area rather than to
+  // the whole grid -- the difference between a few hundred cells and every one
+  // of them, every second.
+  const visited = new Set<number>();
+  for (const [row, col] of cells) {
+    if (row < 0 || row >= rows || col < 0 || col >= cols) continue;
+    const rowStart = Math.max(0, row - 1);
+    const rowEnd = Math.min(rows - 1, row + 1);
+    const colStart = Math.max(0, col - 1);
+    const colEnd = Math.min(cols - 1, col + 1);
+    for (let r = rowStart; r <= rowEnd; r++) {
+      for (let c = colStart; c <= colEnd; c++) {
+        visited.add(r * cols + c);
+      }
+    }
+  }
 
-        for (let sampleX = 0; sampleX < HEATMAP_SUBDIVISIONS; sampleX++) {
-          const x = (sampleX + 0.5) / HEATMAP_SUBDIVISIONS;
-          const colCoord = col + x - 0.5;
-          const density = sampleGrid(values, rows, cols, rowCoord, colCoord);
+  for (const index of visited) {
+    const row = Math.floor(index / cols);
+    const col = index % cols;
 
-          if (density <= MIN_RENDER_DENSITY) continue;
+    for (let sampleY = 0; sampleY < HEATMAP_SUBDIVISIONS; sampleY++) {
+      const y = (sampleY + 0.5) / HEATMAP_SUBDIVISIONS;
+      const rowCoord = row + y - 0.5;
 
-          features.push({
-            type: 'Feature' as const,
-            geometry: {
-              type: 'Point' as const,
-              coordinates: [
-                bounds.west + (col + x) * cellWidth,
-                bounds.north - (row + y) * cellHeight,
-              ],
-            },
-            properties: { density },
-          });
-        }
+      for (let sampleX = 0; sampleX < HEATMAP_SUBDIVISIONS; sampleX++) {
+        const x = (sampleX + 0.5) / HEATMAP_SUBDIVISIONS;
+        const colCoord = col + x - 0.5;
+        const density = sampleGrid(values, rows, cols, rowCoord, colCoord);
+
+        if (density <= MIN_RENDER_DENSITY) continue;
+
+        features.push({
+          type: 'Feature' as const,
+          geometry: {
+            type: 'Point' as const,
+            coordinates: [
+              bounds.west + (col + x) * cellWidth,
+              bounds.north - (row + y) * cellHeight,
+            ],
+          },
+          properties: { density },
+        });
       }
     }
   }

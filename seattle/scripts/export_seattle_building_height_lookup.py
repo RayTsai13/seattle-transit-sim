@@ -50,7 +50,7 @@ def main() -> None:
     skipped_rows = 0
 
     with join_csv.open() as handle:
-        reader = csv.DictReader(handle)
+        reader = csv.DictReader(handle, restval="")
         for row in reader:
             object_id = row.get("footprint_object_id", "").strip()
             height_m_raw = row.get("building_height_m", "").strip()

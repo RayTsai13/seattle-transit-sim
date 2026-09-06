@@ -49,9 +49,8 @@ out tags geom;
 
 
 def fetch_overpass_data(query: str, timeout: int) -> dict:
+    # Verified TLS: these endpoints present valid certificates.
     ssl_context = ssl.create_default_context()
-    ssl_context.check_hostname = False
-    ssl_context.verify_mode = ssl.CERT_NONE
 
     request = Request(
         OVERPASS_URL,
@@ -124,11 +123,22 @@ def main() -> int:
         if feature is not None:
             features.append(feature)
 
+    if not features:
+        # An empty or rate-limited Overpass reply parses fine as JSON. This
+        # file is checked in and rendered directly by the frontend, so writing
+        # an empty collection would silently blank the building layer.
+        raise SystemExit(
+            "Overpass returned no building ways; refusing to overwrite "
+            f"{output_path} with an empty FeatureCollection."
+        )
+
     feature_collection = {
         "type": "FeatureCollection",
         "features": features,
     }
-    output_path.write_text(json.dumps(feature_collection))
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(feature_collection))
+    tmp_path.replace(output_path)
 
     print(
         json.dumps(

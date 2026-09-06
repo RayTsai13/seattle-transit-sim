@@ -22,7 +22,13 @@ from .sim_time import PlaybackController
 
 
 class State:
-    """Single-process simulation state shared by all SSE connections."""
+    """Single-process simulation state shared by all SSE connections.
+
+    The simulation clock is advanced by exactly one producer (the frame ticker
+    in ``server.py``), never by a connection. Connections are pure readers of
+    :meth:`current_frame`, which is composed once per tick and shared, so N
+    connected clients cost the same as one.
+    """
 
     def __init__(
         self,
@@ -42,13 +48,15 @@ class State:
         )
         self.scenario_id: str = DEFAULT_SCENARIO_ID
         self.active_network: ActiveNetwork = default_network_for_scenario(self.scenario_id)
-        self.service = ServiceCapacity(grid, self.active_network)
+        self.service = ServiceCapacity(grid, self.active_network, centers=self.centers)
         self.overlays = LiveOverlayManager(self.centers)
         self.people = self.overlays.people
         self.scenario_revision: int = 0
         self._version: int = 0
         self._state_counter: int = 0
         self._cond: asyncio.Condition | None = None
+        self._latest_frame: dict[str, object] | None = None
+        self._subscribers: int = 0
 
     @property
     def version(self) -> int:
@@ -57,6 +65,20 @@ class State:
     @property
     def state_version(self) -> str:
         return f"state_v{self._state_counter}"
+
+    # -- Subscribers ------------------------------------------------------
+
+    @property
+    def subscriber_count(self) -> int:
+        return self._subscribers
+
+    def add_subscriber(self) -> None:
+        self._subscribers += 1
+
+    def remove_subscriber(self) -> None:
+        self._subscribers = max(0, self._subscribers - 1)
+
+    # -- Change notification ----------------------------------------------
 
     def _ensure_cond(self) -> asyncio.Condition:
         if self._cond is None:
@@ -81,6 +103,8 @@ class State:
                 pass
         return self._version
 
+    # -- Mutations ---------------------------------------------------------
+
     def set_scenario(
         self,
         scenario_id: str,
@@ -96,9 +120,14 @@ class State:
             stops_payload=stops,
             lines_payload=lines,
         )
-        self.service = ServiceCapacity(self.grid, self.active_network)
+        self.service = ServiceCapacity(
+            self.grid,
+            self.active_network,
+            centers=self.centers,
+        )
         self.scenario_revision += 1
         self._state_counter += 1
+        self.invalidate_frame()
 
     def add_person(
         self,
@@ -129,16 +158,21 @@ class State:
             decay_m=decay_m,
         )
         self._state_counter += 1
+        self.invalidate_frame()
         return overlay
 
     def remove_person(self, person_id: str) -> None:
         self.overlays.remove(person_id)
         self._state_counter += 1
+        self.invalidate_frame()
 
     def clear_people(self) -> None:
         if self.people:
             self._state_counter += 1
         self.overlays.clear()
+        self.invalidate_frame()
+
+    # -- Playback ----------------------------------------------------------
 
     def playback_state(self) -> dict[str, object]:
         return self.playback.to_dict()
@@ -153,6 +187,7 @@ class State:
             self.playback.set_playing(is_playing)
         if sim_minutes_per_second is not None:
             self.playback.set_speed(sim_minutes_per_second)
+        self.invalidate_frame()
 
     def seek_playback(
         self,
@@ -166,9 +201,32 @@ class State:
             day_of_week=day_of_week,
             time_bin=time_bin,
         )
+        self.invalidate_frame()
 
     def advance_playback(self) -> None:
         self.playback.advance()
+        self.invalidate_frame()
+
+    def tick(self) -> None:
+        """Advance the clock one frame and refresh the shared frame.
+
+        This is the *only* place the simulation clock moves. Called once per
+        interval by the frame ticker, never by a connection.
+        """
+        self.playback.advance()
+        self.invalidate_frame()
+        self.current_frame()
+
+    # -- Frames -------------------------------------------------------------
+
+    def invalidate_frame(self) -> None:
+        self._latest_frame = None
+
+    def current_frame(self) -> dict[str, object]:
+        """The frame every connection shares, composed at most once per change."""
+        if self._latest_frame is None:
+            self._latest_frame = self.compose_frame()
+        return self._latest_frame
 
     def compose_frame(self) -> dict[str, object]:
         return self.composer.compose(
