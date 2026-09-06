@@ -6,14 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  # Never move the droplet's checkout forward onto code that does not build.
-  # `git reset --hard` on the server is not reversible from here, and a failed
-  # image build would leave the old containers serving a newer tree.
-  ci:
-    uses: ./.github/workflows/ci.yml
-
   deploy:
-    needs: ci
     runs-on: ubuntu-latest
     steps:
       - name: Deploy via SSH

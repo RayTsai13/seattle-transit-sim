@@ -1,6 +1,5 @@
 .git
 .claude
-.venv
 node_modules
 dist
 mock
@@ -9,8 +8,3 @@ data_processing
 backend/tests
 seattle/scripts
 seattle/data/raw
-
-# ~140 MB of intermediate join/feature CSVs that no image needs. The backend
-# image only needs seattle_heatmap_grid.geojson from this directory.
-seattle/data/processed/*.csv
-seattle/data/processed/*_summary.json

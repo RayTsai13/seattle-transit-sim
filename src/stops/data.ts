@@ -22,6 +22,14 @@ export type TransitLine = {
   path?: LonLat[];
 };
 
+export type ExpansionMode = {
+  id: string;
+  name: string;
+  description: string;
+  stops: TransitStop[];
+  lines: TransitLine[];
+};
+
 // ---------------------------------------------------------------------------
 // Stops
 // ---------------------------------------------------------------------------
@@ -119,6 +127,34 @@ export const BALLARD_LINE: TransitLine = {
   ],
   path: BALLARD_TRACK,
 };
+
+// ---------------------------------------------------------------------------
+// Expansion modes (cumulative)
+// ---------------------------------------------------------------------------
+
+export const EXPANSION_MODES: ExpansionMode[] = [
+  {
+    id: 'line-1',
+    name: '1 Line Only',
+    description: "Today's Link 1 Line — Northgate to Rainier Beach",
+    stops: [...LINE_1_STOPS],
+    lines: [LINK_1_LINE],
+  },
+  {
+    id: 'line-1-2',
+    name: '+ 2 Line',
+    description: 'Adds the 2 Line east branch — ID/Chinatown to Judkins Park and beyond',
+    stops: [...LINE_1_STOPS, ...LINE_2_STOPS],
+    lines: [LINK_1_LINE, LINK_2_LINE],
+  },
+  {
+    id: 'line-1-2-ballard',
+    name: '+ Ballard Extension',
+    description: 'Adds the Ballard line — Westlake northwest to Ballard',
+    stops: [...LINE_1_STOPS, ...LINE_2_STOPS, ...BALLARD_STOPS],
+    lines: [LINK_1_LINE, LINK_2_LINE, BALLARD_LINE],
+  },
+];
 
 // ---------------------------------------------------------------------------
 // GeoJSON helpers

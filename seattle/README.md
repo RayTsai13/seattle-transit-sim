@@ -6,9 +6,13 @@ For the frontend/runtime map architecture, see [docs/seattle-map-architecture.md
 
 ## Layout
 
-- `scripts/` (all build-time only; the backend imports none of them)
+- `scripts/`
+  - `build_heatmap_dataset.py`
+    - Builds the Seattle heatmap feature CSV and grid GeoJSON.
   - `build_seattle_station_vectors.py`
     - Builds Seattle station activity vectors from GTFS and Census inputs.
+  - `train_heatmap_model.py`
+    - Trains the baseline Seattle heatmap model and writes metrics/predictions.
   - `extract_seattle_building_heights.py`
     - Extracts official building height attributes from Seattle's `Seattle_BuildingShells` SceneServer.
   - `join_seattle_building_heights.py`
@@ -28,10 +32,10 @@ For the frontend/runtime map architecture, see [docs/seattle-map-architecture.md
   - Seattle-only generated artifacts:
     - `seattle_scene_heights.csv`
     - `seattle_building_height_join.csv`
+    - `seattle_station_vectors.csv`
     - `seattle_heatmap_features.csv`
-    - `seattle_heatmap_grid.geojson` — **the only file the backend reads at
-      runtime**, and only for grid bounds / rows / cols
-    - related summary files
+    - `seattle_heatmap_grid.geojson`
+    - related summary and prediction files
 
 ## Frontend Assets
 
@@ -53,17 +57,12 @@ Other related frontend assets:
 
 ## Typical Flow
 
-The building pipeline is the one that still matters day to day:
-
-1. Run `extract_seattle_building_heights.py`
-2. Run `join_seattle_building_heights.py`
-3. Run `export_seattle_building_regions.py`
-4. The frontend loads the cached region GeoJSON files from `public/seattle/`
-
-The heatmap dataset builder moved to `data_processing/`
-(`src/pipelines/seattle/build_heatmap_dataset.py`). The model-training stage
-that once followed it has been removed: the backend generates demand
-analytically from the land-use model in `backend/landuse.py`.
+1. Run `build_heatmap_dataset.py` if you need Seattle heatmap features.
+2. Run `train_heatmap_model.py` if you need Seattle heatmap predictions.
+3. Run `extract_seattle_building_heights.py`
+4. Run `join_seattle_building_heights.py`
+5. Run `export_seattle_building_regions.py`
+6. The frontend loads the cached region GeoJSON files from `public/seattle/`
 
 ## Current Frontend Behavior
 

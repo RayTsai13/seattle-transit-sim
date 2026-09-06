@@ -48,7 +48,6 @@ SEATTLE_BBOX = (-122.4597, 47.4810, -122.2244, 47.7340)
 GTFS_URL = "https://gtfs.sound.obaweb.org/prod/gtfs_puget_sound_consolidated.zip"
 FREMONT_CSV_URL = "https://data.seattle.gov/resource/65db-xm6k.csv"
 TRANSIT_ACCESS_CSV_URL = "https://performance.seattle.gov/resource/pmj3-v6fx.csv"
-KING_COUNTY_FIPS = "53033"
 LODES_BASE_URL = "https://lehd.ces.census.gov/data/lodes/LODES8/wa"
 CENSUS_TRACT_GEOJSON_URL = (
     "https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json"
@@ -251,12 +250,7 @@ def load_fremont_counts(raw_dir: Path, limit: int, spec: GridSpec) -> pd.DataFra
     }
     counts = fetch_socrata_csv(FREMONT_CSV_URL, raw_dir / FREMONT_BRIDGE_COUNTS_CSV, params)
     if counts.empty:
-        # Must match the grouped frame below, including day_of_week: the
-        # caller merges on ["cell_id", "hour", "day_of_week"], so dropping the
-        # column here turned a missing counter into a KeyError.
-        return pd.DataFrame(
-            columns=["cell_id", "hour", "day_of_week", "observed_count", "bike_count_proxy"]
-        )
+        return pd.DataFrame(columns=["cell_id", "hour", "observed_count", "bike_count_proxy"])
 
     counts["datetime"] = pd.to_datetime(counts["date"], errors="coerce")
     counts["hour"] = counts["datetime"].dt.hour
@@ -265,12 +259,7 @@ def load_fremont_counts(raw_dir: Path, limit: int, spec: GridSpec) -> pd.DataFra
 
     fremont_cell = cell_id_for(47.6480, -122.3495, spec)
     if fremont_cell is None:
-        # Must match the grouped frame below, including day_of_week: the
-        # caller merges on ["cell_id", "hour", "day_of_week"], so dropping the
-        # column here turned a missing counter into a KeyError.
-        return pd.DataFrame(
-            columns=["cell_id", "hour", "day_of_week", "observed_count", "bike_count_proxy"]
-        )
+        return pd.DataFrame(columns=["cell_id", "hour", "observed_count", "bike_count_proxy"])
     counts["cell_id"] = fremont_cell
     return (
         counts.groupby(["cell_id", "hour", "day_of_week"])
@@ -335,12 +324,8 @@ def load_lehd_jobs(raw_dir: Path, year: int, spec: GridSpec) -> pd.DataFrame:
     with gzip.open(xwalk_path, "rt") as handle:
         xwalk = pd.read_csv(handle, usecols=["tabblk2020", "cty", "trct"], dtype="string")
 
-    # LODES `cty` is the full 5-digit state+county FIPS ("53033" for King
-    # County, WA), not the 3-digit county code; and `trct` is already the full
-    # 11-digit tract GEOID, so no prefixing is needed either. The previous
-    # filter matched zero rows, leaving employment_jobs at 0 for every cell.
-    king = xwalk[xwalk["cty"] == KING_COUNTY_FIPS].copy()
-    king["tract_geoid"] = king["trct"]
+    king = xwalk[xwalk["cty"] == "033"].copy()
+    king["tract_geoid"] = "53" + king["cty"] + king["trct"]
     jobs = wac.merge(king, left_on="w_geocode", right_on="tabblk2020", how="inner")
     tract_jobs = jobs.groupby("tract_geoid", as_index=False)["C000"].sum()
 
@@ -367,10 +352,6 @@ def load_lehd_jobs(raw_dir: Path, year: int, spec: GridSpec) -> pd.DataFrame:
     return pd.DataFrame(
         [{"cell_id": cell_id, "employment_jobs": float(tract_jobs["C000"].sum())}]
     )
-
-
-def clamp_unit(value: float) -> float:
-    return max(0.0, min(1.0, float(value)))
 
 
 def min_max(series: pd.Series) -> pd.Series:
@@ -422,16 +403,11 @@ def assemble_features(
 
     features["accessibility_score"] = accessibility_score
     features["target_count"] = features[["observed_count", "optional_observed_count"]].max(axis=1)
-    # `accessibility_score` is a single citywide number, identical in every row.
-    # It used to be passed through min_max(), which returns all zeros for a
-    # constant column -- so the term contributed nothing and the weights
-    # effectively summed to 0.90. It is a scalar shift, applied as one.
-    normalized_accessibility = clamp_unit(accessibility_score)
     features["congestion_score"] = (
         0.45 * min_max(features["target_count"])
         + 0.30 * min_max(features["transit_departures"])
         + 0.15 * min_max(features["employment_jobs"])
-        + 0.10 * normalized_accessibility
+        + 0.10 * min_max(features["accessibility_score"])
     )
     return features
 

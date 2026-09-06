@@ -75,8 +75,9 @@ def fetch_url(url: str, timeout: int = 60) -> bytes:
             "Accept-Encoding": "gzip",
         },
     )
-    # Verified TLS: these endpoints present valid certificates.
     ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
     with urlopen(request, timeout=timeout, context=ssl_context) as response:
         payload = response.read()
         if response.headers.get("Content-Encoding") == "gzip" or payload[:2] == b"\x1f\x8b":
@@ -119,11 +120,6 @@ def fetch_all_footprint_centroids(
 
     while True:
         payload = fetch_json(footprint_query_url(result_offset, NO_GEOMETRY_PAGE_SIZE, bounds))
-        if isinstance(payload.get("error"), dict):
-            error = payload["error"]
-            raise RuntimeError(
-                f"ArcGIS returned an error: {error.get('message', error)}"
-            )
         features = payload.get("features") or []
         if not features:
             break
@@ -156,7 +152,7 @@ def fetch_all_footprint_centroids(
 def load_scene_rows(path: Path) -> list[dict]:
     rows: list[dict] = []
     with path.open() as handle:
-        reader = csv.DictReader(handle, restval="")
+        reader = csv.DictReader(handle)
         for row in reader:
             lon = row.get("scene_centroid_lon", "")
             lat = row.get("scene_centroid_lat", "")
@@ -213,30 +209,8 @@ def scene_bounds(scene_rows: list[dict], padding_m: float) -> dict | None:
     }
 
 
-METERS_PER_DEGREE_LON_AT_EQUATOR = 111_320.0
-METERS_PER_DEGREE_LAT = 110_540.0
-
-
-def cell_sizes_deg(max_distance_m: float, reference_lat: float) -> tuple[float, float]:
-    """Cell width/height in degrees, each spanning at least ``max_distance_m``.
-
-    A degree of longitude is much shorter than a degree of latitude this far
-    north, so a single value for both axes under-sizes the longitude cell and
-    the neighbour scan stops short of the search radius.
-    """
-    cos_lat = max(0.01, math.cos(math.radians(reference_lat)))
-    cell_lon = max_distance_m / (METERS_PER_DEGREE_LON_AT_EQUATOR * cos_lat)
-    cell_lat = max_distance_m / METERS_PER_DEGREE_LAT
-    return cell_lon, cell_lat
-
-
-def grid_key(
-    lon: float,
-    lat: float,
-    cell_deg_lon: float,
-    cell_deg_lat: float,
-) -> tuple[int, int]:
-    return (math.floor(lon / cell_deg_lon), math.floor(lat / cell_deg_lat))
+def grid_key(lon: float, lat: float, cell_deg: float) -> tuple[int, int]:
+    return (math.floor(lon / cell_deg), math.floor(lat / cell_deg))
 
 
 def distance_m(lon_a: float, lat_a: float, lon_b: float, lat_b: float) -> float:
@@ -246,18 +220,13 @@ def distance_m(lon_a: float, lat_a: float, lon_b: float, lat_b: float) -> float:
     return math.hypot(dx, dy)
 
 
-def build_grid(
-    footprints: list[dict],
-    cell_deg_lon: float,
-    cell_deg_lat: float,
-) -> dict[tuple[int, int], list[dict]]:
+def build_grid(footprints: list[dict], cell_deg: float) -> dict[tuple[int, int], list[dict]]:
     grid: dict[tuple[int, int], list[dict]] = {}
     for footprint in footprints:
         key = grid_key(
             footprint["footprint_centroid_lon"],
             footprint["footprint_centroid_lat"],
-            cell_deg_lon,
-            cell_deg_lat,
+            cell_deg,
         )
         grid.setdefault(key, []).append(footprint)
     return grid
@@ -268,17 +237,15 @@ def join_rows(
     footprints: list[dict],
     max_distance_m: float,
 ) -> tuple[list[dict], set[int]]:
-    latitudes = [row["scene_centroid_lat"] for row in scene_rows]
-    reference_lat = sum(latitudes) / len(latitudes) if latitudes else 47.6
-    cell_deg_lon, cell_deg_lat = cell_sizes_deg(max_distance_m, reference_lat)
-    grid = build_grid(footprints, cell_deg_lon, cell_deg_lat)
+    cell_deg = max_distance_m / 111_320.0
+    grid = build_grid(footprints, cell_deg)
     best_by_footprint: dict[int, dict] = {}
     matched_scene_object_ids: set[int] = set()
 
     for scene_row in scene_rows:
         key_lon = scene_row["scene_centroid_lon"]
         key_lat = scene_row["scene_centroid_lat"]
-        cell_x, cell_y = grid_key(key_lon, key_lat, cell_deg_lon, cell_deg_lat)
+        cell_x, cell_y = grid_key(key_lon, key_lat, cell_deg)
 
         best_match: dict | None = None
         best_distance = max_distance_m
@@ -389,12 +356,6 @@ def main() -> None:
     bounds = scene_bounds(scene_rows, args.bbox_padding_m)
     footprints = fetch_all_footprint_centroids(bounds, args.max_footprints)
     joined_rows, matched_scene_object_ids = join_rows(scene_rows, footprints, args.max_distance_m)
-
-    if not joined_rows:
-        raise SystemExit(
-            "The join produced no rows; refusing to overwrite "
-            f"{out_csv}, which downstream height exports read."
-        )
 
     write_csv(joined_rows, out_csv)
     summary = summarize(

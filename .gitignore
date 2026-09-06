@@ -17,10 +17,7 @@ __pycache__/
 *.py[cod]
 .venv/
 
-# Re-creatable data artifacts and raw data caches.
-# NOTE: these paths were committed before these rules existed, so the files
-# remain tracked and these entries only affect newly created files. See the
-# "Known constraints" section of CLAUDE.md.
+# Re-creatable data artifacts and raw data caches
 data_processing/curr_data/raw/
 data_processing/curr_data/processed/
 data_processing/gtfs/
@@ -32,9 +29,6 @@ seattle/data/processed/
 public/seattle/seattle-buildings*.geojson
 public/seattle/seattle-building-heights.json
 public/seattle/seattle-building-regions-summary.json
-
-# Local, per-developer Claude Code settings
-.claude/settings.local.json
 
 # Editor directories and files
 .vscode/*
