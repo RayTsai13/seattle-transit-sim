@@ -82,8 +82,11 @@ Two implementations of the SSE contract live in this repo:
 
 - `mock/server.py` — fully synthetic, drifting hotspots over a 200×170 grid.
   Useful for animating the frontend without any real data.
-- `backend/server.py` — skeleton that loads `seattle_heatmap_grid.geojson`,
-  infers the grid config, and streams its normalized cell densities.
+- `backend/server.py` — the real simulation. Loads `seattle_heatmap_grid.geojson`
+  for grid geometry, then generates demand from a land-use model (residents,
+  jobs, students, visitors per cell x trip rates per hour), subtracts the
+  capacity absorbed by the active transit network, and streams the unmet
+  demand as density.
 
 Either one satisfies the contract in [`docs/heatmap-api-contract.md`](docs/heatmap-api-contract.md).
 
@@ -107,11 +110,12 @@ pip install -r backend/requirements.txt
 uvicorn backend.server:app --host 0.0.0.0 --port 8000
 ```
 
-Override which file/property the skeleton reads via env vars:
+Override runtime config via env vars:
 
 - `HEATMAP_GEOJSON` — path to a `FeatureCollection` of `r{row}_c{col}` cells
-- `HEATMAP_DENSITY_PROPERTY` — which numeric property to normalize as density
+  (read for grid bounds/rows/cols only)
 - `HEATMAP_FRAME_INTERVAL` — seconds between frame ticks (default `1.0`)
+- `HEATMAP_SIM_STEP_SECONDS` — sim-clock advance per frame (default `1800`)
 
 The frontend listens to:
 
@@ -130,7 +134,10 @@ Typical building-data flow:
 Typical heatmap-data flow:
 
 1. Build Seattle grid features
-2. Train or evaluate the Seattle heatmap model
+
+The backend reads the grid GeoJSON for geometry only and generates demand
+analytically from the land-use model in `backend/landuse.py`. There is no
+machine learning in this repository.
 
 See [`seattle/README.md`](seattle/README.md) for the Seattle workspace layout and commands.
 

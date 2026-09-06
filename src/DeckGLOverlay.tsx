@@ -8,7 +8,7 @@ export function DeckGLOverlay(props: MapboxOverlayProps & { interleaved?: boolea
   
   useEffect(() => {
     overlay.setProps(props);
-  }, [props]);
+  }, [overlay, props]);
 
   return null;
 }

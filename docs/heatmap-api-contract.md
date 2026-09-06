@@ -2,60 +2,74 @@
 
 ## Overview
 
-The heatmap runtime streams composed demand-density frames to the frontend map over **Server-Sent Events (SSE)** and accepts scenario/state operations over normal HTTP endpoints.
+The backend streams composed demand-density frames to the frontend map over
+**Server-Sent Events (SSE)** and accepts simulation controls over normal HTTP
+endpoints.
 
-The frontend renderer should treat each streamed frame as the current display state. It should not need to know whether a cell's density came from the baseline model, an active scenario, or both. Scenario deltas and state rebasing are backend responsibilities.
+The frontend treats each streamed frame as the complete current display state.
+Frames are sparse but are **snapshots, not deltas** — a cell absent from a frame
+is zero, not unchanged.
 
-Both processes run locally:
+Two implementations satisfy this contract:
 
-- **Demand heatmap runtime**: `http://localhost:8000`
-- **Frontend dev server**: `http://localhost:5173`
+- `backend/server.py` — the real simulation (land use → demand → transit capacity).
+- `mock/server.py` — a fully synthetic drifting-hotspot generator, no data files.
 
-The current runtime implementation lives in `data_processing/src/runtime/api.py`.
+Both listen on `http://localhost:8000`. The frontend never uses an absolute API host: it
+requests the same-origin path `/api/*`, which the Vite dev server (port 5173) and nginx (in
+the container) each proxy to the backend. See `vite.config.ts` and `nginx.conf`.
+
+Both are exercised by the same test suite -- `backend/tests/test_server_parity.py` runs every
+endpoint-level assertion in this document against both apps, so the mock cannot drift.
 
 ---
 
 ## API Surfaces
 
-The frontend talks to the runtime over these surfaces:
-
-1. **SSE stream**: `GET /api/heatmap/stream`
-2. **Create scenario from precomputed delta**: `POST /api/scenarios`
-3. **Inspect current state**: `GET /api/states/current`
-4. **Inspect scenario status**: `GET /api/scenarios/{scenario_id}/status`
-5. **Inspect state delta summary**: `GET /api/states/{state_version}/deltas`
-
-SSE is one-way from backend to frontend, so user actions that mutate state use HTTP requests alongside the stream.
+| Method | Path | Used by frontend |
+|---|---|---|
+| GET | `/api/heatmap/stream` | yes — the SSE stream |
+| POST | `/api/scenario` | yes — deploy a transit build-out |
+| POST | `/api/playback` | yes — play / pause |
+| POST | `/api/playback/seek` | yes — time dial |
+| POST | `/api/people` | yes — drop a crowd |
+| DELETE | `/api/people/{id}` | yes |
+| DELETE | `/api/people` | yes |
+| GET | `/api/playback` | no — diagnostics |
+| GET | `/api/people` | no — diagnostics |
+| GET | `/healthz` | no — container health check |
 
 ---
 
 ## Grid Configuration
 
-The runtime owns the grid. It loads the grid bounds from the baseline demand prediction CSV and sends them to the frontend on connect.
+The backend owns the grid and sends its dimensions on connect. The frontend
+adapts to whatever size it receives.
 
 ```json
 {
   "bounds": {
-    "west": -122.3566585,
-    "south": 47.5026095,
-    "east": -122.2132615,
-    "north": 47.723038
+    "west": -122.4597,
+    "south": 47.481,
+    "east": -122.22653013600585,
+    "north": 47.73252712899757
   },
-  "rows": 50,
-  "cols": 22
+  "rows": 56,
+  "cols": 35
 }
 ```
 
 ### Cell Indexing
 
 - **Origin**: top-left, northwest corner of the bounding box.
-- **Row**: increases southward.
-- **Col**: increases eastward.
+- **Row**: increases southward. **Col**: increases eastward.
 - **Cell center**:
   - `lon = west + (col + 0.5) * cell_width`
   - `lat = north - (row + 0.5) * cell_height`
 
-No geometry is transmitted on the wire. The frontend computes point coordinates from this shared config.
+No geometry is transmitted on the wire; the frontend derives coordinates from
+this config. `backend/grid.py` enforces the uniformity this formula assumes by
+dropping partial edge cells and normalizing row orientation.
 
 ---
 
@@ -63,266 +77,189 @@ No geometry is transmitted on the wire. The frontend computes point coordinates 
 
 ### Endpoint
 
-```text
-GET http://localhost:8000/api/heatmap/stream
+```
+GET /api/heatmap/stream
 Content-Type: text/event-stream
 Cache-Control: no-cache
 X-Accel-Buffering: no
 ```
 
-The frontend connects with `new EventSource(url)`.
+Wire format, with a monotonically increasing integer `id`:
 
-### `config`
-
-Sent once on connect. Confirms the grid parameters the stream will use.
-
-```text
+```
 id: 0
 event: config
-data: {"bounds":{"west":-122.3566585,"south":47.5026095,"east":-122.2132615,"north":47.723038},"rows":50,"cols":22}
+data: {"bounds": {...}, "rows": 56, "cols": 35}
+
 ```
+
+### Handshake order is load-bearing
+
+On connect the server **must** emit, in this order:
+
+1. `config` — the grid. The frontend discards every frame that arrives before it.
+2. `scenario` — `{"scenario_id": "line-1"}`.
+3. `playback` — the full playback state (see below).
+
+Then `frame` events repeat, with `scenario` and `playback` re-emitted whenever
+they change. The frontend's loading overlay clears only once it has seen *all
+four* of config, a confirmed scenario, at least one frame, and a playback state.
+Omitting the initial `playback` event leaves the app stuck on the loading screen.
 
 ### `frame`
-
-Sent repeatedly while the simulation runs. Each frame is sparse on the wire but is semantically a complete snapshot for the current simulation time and state.
-
-```text
-id: 42
-event: frame
-data: {"timestamp":1714070400.0,"state_version":"state_v1","sim_time":{"day_of_week":0,"time_bin":510,"minute_of_week":510},"cells":[[12,34,0.82],[13,34,0.65]]}
-```
-
-### Event IDs
-
-Every event includes a monotonically increasing `id`. If the SSE connection drops, the browser may reconnect with `Last-Event-ID`. The runtime may resume from that point later, but the current safe behavior is to resend `config` and continue streaming current frames.
-
----
-
-## Frame Schema
 
 ```json
 {
   "timestamp": 1714070400.0,
   "state_version": "state_v1",
-  "sim_time": {
-    "day_of_week": 0,
-    "time_bin": 510,
-    "minute_of_week": 510
-  },
-  "cells": [
-    [12, 34, 0.82],
-    [13, 34, 0.65]
-  ]
+  "sim_time": { "day_of_week": 0, "time_bin": 510, "minute_of_week": 510 },
+  "cells": [[12, 34, 0.82], [13, 34, 0.65]]
 }
 ```
 
-| Field | Type | Description |
-| --- | --- | --- |
-| `timestamp` | float | Unix timestamp when the frame is emitted |
-| `state_version` | string | Current immutable simulation state ID |
-| `sim_time` | object | Simulated time within the repeating week |
-| `day_of_week` | int | 0-indexed day in the repeating week |
-| `time_bin` | int | Minute-of-day model bin, e.g. `510` for 08:30 |
-| `minute_of_week` | int | `day_of_week * 1440 + minute_of_day` |
-| `cells` | array | Sparse list of `[row, col, density]` tuples |
-| `row` | int | 0-indexed grid row |
-| `col` | int | 0-indexed grid column |
-| `density` | float | Normalized display intensity, range `[0.0, 1.0]` |
+| Field | Type | Notes |
+|---|---|---|
+| `timestamp` | float | Unix seconds. Not read by the frontend. |
+| `state_version` | string | `state_v<N>`, **N non-decreasing**. Frames older than the newest N seen from a `POST /api/scenario` response are dropped. |
+| `sim_time.day_of_week` | int | 0 = Sunday. |
+| `sim_time.time_bin` | int | Minute-of-day, a multiple of `time_bin_minutes`. |
+| `sim_time.minute_of_week` | int | `day_of_week * 1440 + minute_of_day`. |
+| `cells` | array | `[row, col, density]`, `density` in `(0, 1]`. |
 
-### Frame Semantics
+Cells at or below the display threshold are omitted.
 
-- **Sparse payload**: cells with zero or below-threshold density may be omitted.
-- **Complete snapshot**: each `frame` replaces the previous frame entirely. It is not a frontend-applied delta.
-- **Composed state**: `density` already includes baseline demand plus all active scenario effects for `state_version` and `sim_time`.
-- **Normalization**: the backend is responsible for clamping/normalizing density to `[0.0, 1.0]`.
-
----
-
-## Scenario State Semantics
-
-The runtime tracks immutable state versions.
-
-```text
-state_baseline = baseline only
-state_v1 = baseline + first scenario delta
-state_v2 = baseline + first scenario delta + second scenario delta
-```
-
-Each scenario record contains:
-
-- `scenario_id`
-- `scenario_type`
-- `state_before`
-- `state_after`
-- `created_at_real_time`
-- `created_at_sim_time`
-- `effective_from_tick`
-- `effective_from_sim_time`
-- `delta_source`
-- `delta_frame_count`
-- `delta_changed_cells`
-
-The delta registered for a scenario should already represent:
-
-```text
-score(state_after) - score(state_before)
-```
-
-That is what lets the runtime handle scenarios introduced after previous user edits without always comparing to the original baseline.
-
----
-
-## `POST /api/scenarios`
-
-Register a scenario from a precomputed scenario-delta CSV. The runtime currently accepts `type: "precomputed_delta"`.
-
-### Request
-
-```http
-POST /api/scenarios
-Content-Type: application/json
-```
+### `playback`
 
 ```json
 {
-  "type": "precomputed_delta",
-  "scenario_id": "event_downtown_game",
-  "delta_csv": "curr_data/processed/model_outputs/demand_heatmap_scenario_predictions.csv",
-  "effective_from_tick": 120
+  "is_playing": true,
+  "current_tick": 0,
+  "sim_step_seconds": 1800,
+  "sim_minutes_per_second": 30.0,
+  "frame_interval_seconds": 1.0,
+  "time_bin_minutes": 30,
+  "sim_time": { "day_of_week": 0, "time_bin": 0, "minute_of_week": 0 }
 }
 ```
 
-| Field | Type | Required | Description |
-| --- | --- | --- | --- |
-| `type` | string | No | Must be `precomputed_delta`; defaults to `precomputed_delta` |
-| `scenario_id` | string | No | Stable scenario ID; generated if omitted |
-| `delta_csv` | string | Yes | Path to a scenario output CSV containing `demand_delta` or scenario/baseline score columns |
-| `effective_from_tick` | int | No | Simulation tick when this scenario becomes active; defaults to current tick |
-| `state_after` | string | No | Explicit next state version; generated if omitted |
+`sim_minutes_per_second × frame_interval_seconds` **must** equal the real
+advance in `minute_of_week` between consecutive playback events. The frontend's
+train interpolator drives its animation from this rate and resyncs when its own
+clock drifts, so a wrong value makes trains run at the wrong speed.
+
+Two consequences for implementors:
+
+- **One producer.** The clock must be advanced by a single process-wide ticker, never from
+  inside a per-connection stream generator — otherwise N open tabs advance it N times per
+  interval and the declared rate is a lie.
+- **Whole minutes.** `minute_of_week` is an integer, so `sim_step_seconds` must be a whole
+  number of minutes. A fractional step reports a rate the clock cannot actually achieve.
+
+`POST /api/playback` with a `sim_minutes_per_second` changes how fast time passes and **must
+not move `sim_time`**: the clock is stored absolutely, not derived from `current_tick ×
+sim_step_seconds`. `current_tick` is a monotonic count of frames played, with no fixed
+relationship to `sim_time`.
+
+### `clear`
+
+Optional. Resets the frontend to an empty grid. Neither server emits it.
+
+---
+
+## `POST /api/scenario`
+
+```json
+{
+  "scenario_id": "line-1-2-ballard",
+  "stops": [{ "id": "ballard", "name": "Ballard", "coordinates": [-122.3765, 47.6677] }],
+  "lines": [{ "id": "ballard-line", "name": "Ballard Line", "stopIds": ["ballard", "interbay"], "path": [[-122.3765, 47.6677], [-122.3765, 47.6478]] }]
+}
+```
+
+`scenario_id` must be one of `line-1`, `line-1-2`, `line-1-2-ballard`; anything
+else is a 400. `stops` and `lines` are optional — omit or malform them and the
+server falls back to its built-in network for that id. Extra keys on stops and
+lines (the frontend sends `color` and `offset`) must be tolerated.
 
 ### Response
 
 ```json
-{
-  "scenario_id": "event_downtown_game",
-  "scenario_type": "precomputed_delta",
-  "state_before": "state_baseline",
-  "state_after": "state_v1",
-  "created_at_real_time": 1714070400.0,
-  "created_at_sim_time": {
-    "day_of_week": 0,
-    "time_bin": 510,
-    "minute_of_week": 510
-  },
-  "effective_from_tick": 120,
-  "effective_from_sim_time": {
-    "day_of_week": 0,
-    "time_bin": 510,
-    "minute_of_week": 510
-  },
-  "status": "ready",
-  "delta_source": "curr_data/processed/model_outputs/demand_heatmap_scenario_predictions.csv",
-  "delta_frame_count": 15,
-  "delta_changed_cells": 852
-}
+{ "scenario_id": "line-1-2-ballard", "frame": { "...": "a full frame" } }
 ```
 
-### Errors
-
-- `400 Bad Request`: unsupported scenario type, missing `delta_csv`, unreadable CSV, or invalid CSV schema.
-- `409 Conflict`: reserved for duplicate `scenario_id` handling if exposed by the state manager.
+**`frame` must be non-null.** The frontend gates all SSE frames from the moment
+`setScenario` is called until either this frame arrives or a matching `scenario`
+event does. Returning `{"scenario_id": ...}` alone freezes the heatmap.
 
 ---
 
-## `GET /api/states/current`
+## Playback
 
-Returns the current runtime state and registered scenarios.
+`POST /api/playback` takes any subset of `{"is_playing": bool,
+"sim_minutes_per_second": float > 0}`; absent keys are unchanged.
+
+`POST /api/playback/seek` takes either `{"minute_of_week": int}` or
+`{"day_of_week": int, "time_bin": int}`.
+
+Both return the **full** playback state, not a partial. `GET /api/playback`
+returns the same shape.
+
+---
+
+## People (crowd drops)
+
+`POST /api/people` → **201**
 
 ```json
-{
-  "state_version": "state_v1",
-  "current_tick": 120,
-  "sim_time": {
-    "day_of_week": 0,
-    "time_bin": 510,
-    "minute_of_week": 510
-  },
-  "scenarios": []
-}
+{ "lat": 47.606, "lon": -122.333, "count": 416, "kind": "crowd", "duration_minutes": 240 }
 ```
 
----
+`lat`/`lon` are required and must fall inside the grid bounds (else 400).
+`count` defaults to 1. `kind`, `duration_minutes`, `radius_m`, and `decay_m` are
+optional tuning fields.
 
-## `GET /api/scenarios/{scenario_id}/status`
+Response is `{"id", "lat", "lon", "count"}`, plus the tuning fields if any were
+sent. The UI drops a crowd as **12 concurrent POSTs**, so the endpoint must
+handle a burst.
 
-Returns the scenario record for a registered scenario.
-
-### Errors
-
-- `404 Not Found`: unknown `scenario_id`.
-
----
-
-## `GET /api/states/{state_version}/deltas`
-
-Returns the scenario-delta summary associated with a state version.
-
-This endpoint does not currently return every changed cell. It returns metadata such as source file, frame count, and changed-cell count.
-
-### Errors
-
-- `404 Not Found`: unknown `state_version`.
+`DELETE /api/people/{id}` → 204, or 404 for an unknown id.
+`DELETE /api/people` → 204, clears all.
+`GET /api/people` → `{"people": [{"id", "lat", "lon", "count"}, ...]}`.
 
 ---
 
 ## Backend Implementation Requirements
 
-1. **CORS**: allow requests from `http://localhost:5173` or `*`.
-2. **SSE response headers**:
-   - `Content-Type: text/event-stream`
-   - `Cache-Control: no-cache`
-   - `X-Accel-Buffering: no`
-3. **SSE event format**: `id: <int>\nevent: <type>\ndata: <json>\n\n`
-4. **JSON request bodies**: `Content-Type: application/json` on `POST /api/scenarios`.
-5. **On client disconnect**: stop generating frames for that connection.
-6. **Backend-composed frames**: frontend should not apply scenario deltas to the heatmap stream.
+- CORS must allow the frontend origin (both servers use `*`).
+- Send the SSE headers above and do not buffer responses.
+- Stop the generator when the client disconnects.
+- Compose frames server-side; the frontend applies no deltas.
+- Every mutating endpoint should wake open streams so the change is visible
+  immediately rather than at the next tick.
 
 ---
 
 ## Frontend Connection Example
 
-```typescript
-const source = new EventSource("http://localhost:8000/api/heatmap/stream");
+```ts
+const source = new EventSource('/api/heatmap/stream');
 
-source.addEventListener("config", (e) => {
-  const config = JSON.parse(e.data);
-  // initialize grid
-});
-
-source.addEventListener("frame", (e) => {
+let config: GridConfig | null = null;
+source.addEventListener('config', (e) => { config = JSON.parse(e.data); });
+source.addEventListener('frame', (e) => {
+  if (!config) return;                       // frames before config are dropped
   const frame = JSON.parse(e.data);
-  // convert frame.cells to GeoJSON and update MapLibre source
+  render(frameToGeoJSON(frame.cells, config));
 });
-
-async function registerScenario(deltaCsv: string) {
-  const response = await fetch("http://localhost:8000/api/scenarios", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      type: "precomputed_delta",
-      delta_csv: deltaCsv,
-    }),
-  });
-  return response.json();
-}
 ```
 
-The heatmap stream is independent from the Seattle building layer. The frontend map loads buildings from local cached files in `public/seattle/` and overlays the SSE heatmap on top.
+See `src/heatmap/stream.ts` for the authoritative client, including the pending
+scenario gate and the `state_version` ordering check.
 
 ---
 
 ## Error Handling
 
-- **SSE drops**: `EventSource` auto-reconnects. The runtime resends `config` and continues streaming frames.
-- **Repeated `config` events**: frontend should handle them idempotently.
-- **Scenario registration failures**: surface to the user instead of retrying silently.
+Non-2xx responses throw in the frontend API layer. SSE errors are logged and
+the browser reconnects automatically; the server must tolerate reconnects and
+replay the full handshake each time.

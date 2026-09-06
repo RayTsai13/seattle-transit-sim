@@ -9,7 +9,7 @@ ENV HEATMAP_GEOJSON=/app/seattle/data/processed/seattle_heatmap_grid.geojson
 COPY backend/requirements.txt ./backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 
-COPY backend/__init__.py backend/grid.py backend/server.py backend/state.py ./backend/
+COPY backend/*.py ./backend/
 COPY seattle/data/processed/seattle_heatmap_grid.geojson ./seattle/data/processed/seattle_heatmap_grid.geojson
 
 EXPOSE 8000

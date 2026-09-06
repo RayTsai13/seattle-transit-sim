@@ -7,7 +7,7 @@ import {
   Marker,
 } from "react-map-gl/maplibre";
 import type { FeatureCollection, Geometry, Point } from "geojson";
-import type { Map as MapLibreMap } from "maplibre-gl";
+import type { LngLatBoundsLike, Map as MapLibreMap } from "maplibre-gl";
 import type { LayerProps } from "react-map-gl/maplibre";
 import type {
   MapLayerMouseEvent,
@@ -17,7 +17,7 @@ import type {
 import "maplibre-gl/dist/maplibre-gl.css";
 import "./App.css";
 import { useHeatmap } from "./heatmap/stream.ts";
-import { heatmapLayer } from "./heatmap/layer.ts";
+import { HEATMAP_LAYER_ID, heatmapLayer } from "./heatmap/layer.ts";
 import { DEPLOY_STEPS, stopsToGeoJSON, linesToGeoJSON } from "./stops/data.ts";
 import type { TransitStop, TransitLine } from "./stops/data.ts";
 import {
@@ -52,6 +52,25 @@ const blueLight = new DirectionalLight({
 });
 
 const lightingEffect = new LightingEffect({ ambientLight, blueLight });
+// Stable identities: a fresh array or layer literal on every render makes
+// deck.gl re-diff its effects and re-upload the Space Needle model each frame.
+const deckEffects = [lightingEffect];
+
+const SPACE_NEEDLE_DATA = [{ position: [-122.3493, 47.6205] as [number, number] }];
+const spaceNeedleLayer = new ScenegraphLayer({
+  id: "space-needle-3d-v5",
+  data: SPACE_NEEDLE_DATA,
+  scenegraph: "/seattle/SPACE NEEDLE.glb",
+  getPosition: (d: { position: [number, number] }) => d.position,
+  getOrientation: [0, 0, 90],
+  getScale: [1, 1, 1],
+  sizeScale: 1.2,
+  opacity: 0.6,
+  _lighting: "pbr",
+  parameters: {
+    depthTest: true,
+  },
+});
 
 const initialViewState = {
   longitude: -122.3337,
@@ -59,11 +78,6 @@ const initialViewState = {
   zoom: 15.3,
   pitch: 55,
   bearing: -18,
-};
-
-const emptyFeatureCollection: FeatureCollection<Geometry> = {
-  type: "FeatureCollection",
-  features: [],
 };
 
 type Bounds = {
@@ -79,6 +93,19 @@ type BuildingRegion = {
   url: string;
   bounds: Bounds;
 };
+
+type DemandTooltip = {
+  x: number;
+  y: number;
+  demandIndex: number;
+  density: number;
+  estimatedTripsPerHour: number;
+  pressureLabel: string;
+};
+
+const DEMAND_TOOLTIP_WIDTH = 196;
+const DEMAND_TOOLTIP_HEIGHT = 122;
+const DEMAND_TOOLTIP_MARGIN = 12;
 
 const BUILDING_REGIONS: BuildingRegion[] = [
   {
@@ -137,6 +164,50 @@ const BUILDING_REGIONS: BuildingRegion[] = [
     },
   },
 ];
+
+const CAMERA_BOUNDARY_PADDING_DEGREES = 0.003;
+
+// ~150 m expressed as degrees of latitude; longitude is scaled by cos(lat)
+// at the drop point so the scatter stays circular on the ground.
+const CROWD_SCATTER_RADIUS_DEG = 150 / 111_320;
+
+function mergeBoundsList(boundsList: Bounds[]) {
+  const firstBounds = boundsList[0];
+  if (!firstBounds) {
+    throw new Error("Camera boundary requires at least one building region.");
+  }
+
+  return boundsList.slice(1).reduce<Bounds>(
+    (merged, bounds) => ({
+      west: Math.min(merged.west, bounds.west),
+      south: Math.min(merged.south, bounds.south),
+      east: Math.max(merged.east, bounds.east),
+      north: Math.max(merged.north, bounds.north),
+    }),
+    firstBounds,
+  );
+}
+
+function padBoundsByDegrees(bounds: Bounds, padding: number) {
+  return {
+    west: bounds.west - padding,
+    south: bounds.south - padding,
+    east: bounds.east + padding,
+    north: bounds.north + padding,
+  };
+}
+
+const cameraBoundary = padBoundsByDegrees(
+  mergeBoundsList(BUILDING_REGIONS.map((region) => region.bounds)),
+  CAMERA_BOUNDARY_PADDING_DEGREES,
+);
+
+const cameraMaxBounds = [
+  cameraBoundary.west,
+  cameraBoundary.south,
+  cameraBoundary.east,
+  cameraBoundary.north,
+] satisfies LngLatBoundsLike;
 
 const REGION_LOAD_ORDER = [
   "downtown-core",
@@ -271,13 +342,6 @@ function intersectsBounds(a: Bounds, b: Bounds) {
   );
 }
 
-function mergeFeatureCollections(collections: FeatureCollection<Geometry>[]) {
-  return {
-    type: "FeatureCollection",
-    features: collections.flatMap((collection) => collection.features),
-  } satisfies FeatureCollection<Geometry>;
-}
-
 function sortRegionIds(regionIds: string[]) {
   return [...new Set(regionIds)].sort(
     (left, right) =>
@@ -293,7 +357,42 @@ const initialBounds = {
   north: 47.6195,
 };
 
+function clampNumber(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function demandMetricsFromDensity(density: number) {
+  const normalizedDensity = clampNumber(density, 0, 1);
+  const demandIndex = Math.round(normalizedDensity * 100);
+  const estimatedTripsPerHour = Math.round(
+    (45 + Math.pow(normalizedDensity, 1.35) * 4200) / 10,
+  ) * 10;
+
+  let pressureLabel = "Quiet";
+  if (demandIndex >= 82) {
+    pressureLabel = "Severe";
+  } else if (demandIndex >= 64) {
+    pressureLabel = "High";
+  } else if (demandIndex >= 42) {
+    pressureLabel = "Elevated";
+  } else if (demandIndex >= 20) {
+    pressureLabel = "Moderate";
+  }
+
+  return {
+    demandIndex,
+    density: normalizedDensity,
+    estimatedTripsPerHour,
+    pressureLabel,
+  };
+}
+
+function formatDemandNumber(value: number) {
+  return new Intl.NumberFormat("en-US").format(value);
+}
+
 function App() {
+  const [isHeatmapVisible, setIsHeatmapVisible] = useState(false);
   const {
     geojson: heatmapData,
     setScenario,
@@ -302,7 +401,8 @@ function App() {
     seekTo,
     addPeople,
     diagnostics: heatmapDiagnostics,
-  } = useHeatmap();
+    retryConnection,
+  } = useHeatmap({ renderGeometry: isHeatmapVisible });
   const showHeatmapDebug = useMemo(
     () => new URLSearchParams(window.location.search).has("debugHeatmap"),
     [],
@@ -310,14 +410,14 @@ function App() {
 
   // Deploy state: index of the highest deployed step (0 = Line 1 only)
   const [deployedIndex, setDeployedIndex] = useState(0);
+  const [demandTooltip, setDemandTooltip] = useState<DemandTooltip | null>(
+    null,
+  );
 
   // Building state
   const [regionCollections, setRegionCollections] = useState<
     Record<string, FeatureCollection<Geometry>>
   >({});
-  const [buildings, setBuildings] = useState<FeatureCollection<Geometry>>(
-    emptyFeatureCollection,
-  );
   const [queryBounds, setQueryBounds] = useState(initialBounds);
   const [queuedRegionIds, setQueuedRegionIds] = useState<string[]>(
     REGION_LOAD_ORDER.slice(1) as unknown as string[],
@@ -326,16 +426,16 @@ function App() {
     REGION_LOAD_ORDER[0],
   );
   const [regionErrors, setRegionErrors] = useState<Record<string, string>>({});
-
-  useEffect(() => {
-    setScenario(DEPLOY_STEPS[deployedIndex].id).catch((err) => {
-      console.warn("[heatmap] failed to set scenario", err);
-    });
-  }, [deployedIndex, setScenario]);
+  // Sorted so the render order of the <Source> list is stable as regions
+  // stream in; each keeps its own tiles, so a new region costs only itself.
+  const loadedRegions = useMemo(
+    () =>
+      Object.entries(regionCollections).sort(([a], [b]) => a.localeCompare(b)),
+    [regionCollections],
+  );
 
   // Time controls
   const [timeOfDay, setTimeOfDay] = useState(0);
-  const [isPlaying, setIsPlaying] = useState(false);
   const [dayOfWeek, setDayOfWeek] = useState(0);
   const [hoveredDay, setHoveredDay] = useState<number | null>(null);
   const hoverTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -344,6 +444,7 @@ function App() {
   const selectedDayRef = useRef(dayOfWeek);
   const [isDraggingDial, setIsDraggingDial] = useState(false);
   const mapRef = useRef<MapRef | null>(null);
+  const [isMapLoaded, setIsMapLoaded] = useState(false);
   const [offscreenArrow, setOffscreenArrow] = useState<{
     x: number;
     y: number;
@@ -354,6 +455,28 @@ function App() {
   const [viewMode, setViewMode] = useState<"top-down" | "angled">("angled");
   const [isPitchLocked, setIsPitchLocked] = useState(false);
   const isAnimatingView = useRef(false);
+  const viewAnimationTimersRef = useRef<number[]>([]);
+  const clearViewAnimationTimers = useCallback(() => {
+    for (const handle of viewAnimationTimersRef.current) {
+      window.clearTimeout(handle);
+    }
+    viewAnimationTimersRef.current = [];
+  }, []);
+
+  // One place to drop every pending timer when the component goes away.
+  useEffect(
+    () => () => {
+      for (const handle of viewAnimationTimersRef.current) {
+        window.clearTimeout(handle);
+      }
+      viewAnimationTimersRef.current = [];
+      if (hoverTimeoutRef.current !== null) {
+        clearTimeout(hoverTimeoutRef.current);
+        hoverTimeoutRef.current = null;
+      }
+    },
+    [],
+  );
 
   // Crowd drop controls
   const [crowdSize, setCrowdSize] = useState<number>(5000);
@@ -363,20 +486,16 @@ function App() {
     y: number;
   } | null>(null);
 
-  const backendIsPlaying = playback?.is_playing ?? isPlaying;
+  const backendIsPlaying = playback?.is_playing ?? false;
   const interpolatedMinuteOfWeek = useInterpolatedMinuteOfWeek(playback);
 
   useEffect(() => {
     if (!playback?.sim_time || isDraggingDial) return;
-    setDayOfWeek(playback.sim_time.day_of_week);
-    setTimeOfDay(playback.sim_time.time_bin);
+    queueMicrotask(() => {
+      setDayOfWeek(playback.sim_time.day_of_week);
+      setTimeOfDay(playback.sim_time.time_bin);
+    });
   }, [playback?.sim_time, isDraggingDial]);
-
-  useEffect(() => {
-    if (playback) {
-      setIsPlaying(playback.is_playing);
-    }
-  }, [playback]);
 
   useEffect(() => {
     selectedTimeRef.current = timeOfDay;
@@ -405,6 +524,12 @@ function App() {
     return { activeStops: stops, activeLines: lines };
   }, [deployedIndex]);
 
+  useEffect(() => {
+    setScenario(DEPLOY_STEPS[deployedIndex].id, activeStops, activeLines).catch((err) => {
+      console.warn("[heatmap] failed to set scenario", err);
+    });
+  }, [activeLines, activeStops, deployedIndex, setScenario]);
+
   const stopsGeoJSON = useMemo(
     () => stopsToGeoJSON(activeStops, activeLines),
     [activeStops, activeLines],
@@ -419,20 +544,7 @@ function App() {
   );
   const deckLayers = useMemo(
     () => [
-      new ScenegraphLayer({
-        id: "space-needle-3d-v5",
-        data: [{ position: [-122.3493, 47.6205] }],
-        scenegraph: "/seattle/SPACE NEEDLE.glb",
-        getPosition: (d: { position: [number, number] }) => d.position,
-        getOrientation: [0, 0, 90],
-        getScale: [1, 1, 1],
-        sizeScale: 1.2,
-        opacity: 0.6,
-        _lighting: "pbr",
-        parameters: {
-          depthTest: true,
-        },
-      }),
+      spaceNeedleLayer,
       new ScatterplotLayer({
         id: "train-glow-layer",
         beforeId: "transit-stops-labels",
@@ -480,10 +592,6 @@ function App() {
 
   // ── Building loading effects ──
   useEffect(() => {
-    setBuildings(mergeFeatureCollections(Object.values(regionCollections)));
-  }, [regionCollections]);
-
-  useEffect(() => {
     const loadedRegionIds = Object.keys(regionCollections);
     const inViewRegionIds = BUILDING_REGIONS.filter((region) =>
       intersectsBounds(region.bounds, queryBounds),
@@ -498,17 +606,19 @@ function App() {
         !regionErrors[regionId],
     );
 
-    setQueuedRegionIds((current) =>
-      sortRegionIds([
-        ...current.filter(
-          (regionId) =>
-            !loadedRegionIds.includes(regionId) &&
-            regionId !== activeRegionId &&
-            !regionErrors[regionId],
-        ),
-        ...pendingRegionIds,
-      ]),
-    );
+    queueMicrotask(() => {
+      setQueuedRegionIds((current) =>
+        sortRegionIds([
+          ...current.filter(
+            (regionId) =>
+              !loadedRegionIds.includes(regionId) &&
+              regionId !== activeRegionId &&
+              !regionErrors[regionId],
+          ),
+          ...pendingRegionIds,
+        ]),
+      );
+    });
   }, [activeRegionId, queryBounds, regionCollections, regionErrors]);
 
   useEffect(() => {
@@ -516,8 +626,10 @@ function App() {
       return;
     }
 
-    setActiveRegionId(queuedRegionIds[0]);
-    setQueuedRegionIds((current) => current.slice(1));
+    queueMicrotask(() => {
+      setActiveRegionId(queuedRegionIds[0]);
+      setQueuedRegionIds((current) => current.slice(1));
+    });
   }, [activeRegionId, queuedRegionIds]);
 
   useEffect(() => {
@@ -529,15 +641,17 @@ function App() {
       (candidate) => candidate.id === activeRegionId,
     );
     if (!region) {
-      setActiveRegionId(null);
+      queueMicrotask(() => setActiveRegionId(null));
       return undefined;
     }
 
     const controller = new AbortController();
-    setRegionErrors((current) => {
-      const next = { ...current };
-      delete next[activeRegionId];
-      return next;
+    queueMicrotask(() => {
+      setRegionErrors((current) => {
+        const next = { ...current };
+        delete next[activeRegionId];
+        return next;
+      });
     });
 
     void fetchRegionBuildings(region, controller.signal)
@@ -562,6 +676,9 @@ function App() {
         }
       })
       .finally(() => {
+        // An aborted run has already been superseded; clearing the active id
+        // here would cancel the replacement request that now owns it.
+        if (controller.signal.aborted) return;
         setActiveRegionId((current) =>
           current === region.id ? null : current,
         );
@@ -570,7 +687,10 @@ function App() {
     return () => {
       controller.abort();
     };
-  }, [activeRegionId, queryBounds]);
+    // Deliberately not keyed on `queryBounds`: this effect does not read it,
+    // and re-running on every pan aborted in-flight downloads of region files
+    // up to 34 MB, so large regions could never finish while the user explored.
+  }, [activeRegionId]);
 
   function updateBuildingsForViewport(map: MapRef) {
     const nextBounds = boundsFromMap(map);
@@ -675,7 +795,14 @@ function App() {
     const edgeX = cx + t * cos;
     const edgeY = cy + t * sin;
 
-    setOffscreenArrow({ x: edgeX, y: edgeY, angle: screenAngleDeg });
+    setOffscreenArrow((current) =>
+      current &&
+      Math.abs(current.x - edgeX) < 0.5 &&
+      Math.abs(current.y - edgeY) < 0.5 &&
+      Math.abs(current.angle - screenAngleDeg) < 0.5
+        ? current
+        : { x: edgeX, y: edgeY, angle: screenAngleDeg },
+    );
   }, [triggerCoords]);
 
   useEffect(() => {
@@ -705,30 +832,95 @@ function App() {
       setIsPitchLocked(false);
       setViewMode("angled");
       isAnimatingView.current = true;
-      setTimeout(() => {
-        mapRef.current?.easeTo({ pitch: 55, duration: 1000 });
-        setTimeout(() => {
-          isAnimatingView.current = false;
-        }, 1100);
-      }, 50);
+      // Tracked so a rapid double-toggle cannot leave an earlier timer to
+      // clear `isAnimatingView` while the newer ease is still running, and so
+      // neither timer survives unmount.
+      clearViewAnimationTimers();
+      viewAnimationTimersRef.current.push(
+        window.setTimeout(() => {
+          mapRef.current?.easeTo({ pitch: 55, duration: 1000 });
+          viewAnimationTimersRef.current.push(
+            window.setTimeout(() => {
+              isAnimatingView.current = false;
+            }, 1100),
+          );
+        }, 50),
+      );
     }
   };
+
+  const deployNextStep = useCallback(() => {
+    setDeployedIndex((current) =>
+      Math.min(current + 1, DEPLOY_STEPS.length - 1),
+    );
+  }, []);
 
   // ── Map click handler — deploy on trigger click ──
   const handleMapClick = useCallback(
     (e: MapLayerMouseEvent) => {
       if (!nextStep) return;
-      const features = e.features;
-      if (features && features.length > 0) {
-        setDeployedIndex((prev) => prev + 1);
+      const clickedDeployTarget = e.features?.some((feature) =>
+        feature.layer.id === "deploy-pulse-ring" ||
+        feature.layer.id === "deploy-glow-dot",
+      );
+      if (clickedDeployTarget) {
+        deployNextStep();
       }
     },
-    [nextStep],
+    [deployNextStep, nextStep],
+  );
+
+  const handleMapMouseMove = useCallback(
+    (e: MapLayerMouseEvent) => {
+      if (!isHeatmapVisible) {
+        setDemandTooltip(null);
+        return;
+      }
+
+      let hoveredDensity = Number.NaN;
+      for (const feature of e.features ?? []) {
+        if (feature.layer.id !== HEATMAP_LAYER_ID) continue;
+        const density = Number(feature.properties?.density ?? 0);
+        if (density > hoveredDensity || Number.isNaN(hoveredDensity)) {
+          hoveredDensity = density;
+        }
+      }
+
+      if (!Number.isFinite(hoveredDensity)) {
+        setDemandTooltip(null);
+        return;
+      }
+
+      const container = mapRef.current?.getContainer();
+      const width = container?.clientWidth ?? window.innerWidth;
+      const height = container?.clientHeight ?? window.innerHeight;
+      const x = clampNumber(
+        e.point.x + 14,
+        DEMAND_TOOLTIP_MARGIN,
+        width - DEMAND_TOOLTIP_WIDTH - DEMAND_TOOLTIP_MARGIN,
+      );
+      const y = clampNumber(
+        e.point.y - DEMAND_TOOLTIP_HEIGHT - 14,
+        DEMAND_TOOLTIP_MARGIN,
+        height - DEMAND_TOOLTIP_HEIGHT - DEMAND_TOOLTIP_MARGIN,
+      );
+
+      const metrics = demandMetricsFromDensity(hoveredDensity);
+      setDemandTooltip((current) =>
+        current &&
+        current.x === x &&
+        current.y === y &&
+        current.estimatedTripsPerHour === metrics.estimatedTripsPerHour
+          ? current
+          : { x, y, ...metrics },
+      );
+    },
+    [isHeatmapVisible],
   );
 
   // ── Time controls ──
-  const updateTimeFromPointer = (clientX: number, clientY: number) => {
-    if (!dialRef.current) return timeOfDay;
+  const updateTimeFromPointer = useCallback((clientX: number, clientY: number) => {
+    if (!dialRef.current) return selectedTimeRef.current;
     const rect = dialRef.current.getBoundingClientRect();
     const cx = rect.left + rect.width / 2;
     const cy = rect.top + rect.height / 2;
@@ -741,7 +933,7 @@ function App() {
     selectedTimeRef.current = newTime;
     setTimeOfDay(newTime);
     return newTime;
-  };
+  }, []);
 
   useEffect(() => {
     const handlePointerMove = (e: PointerEvent) => {
@@ -764,7 +956,7 @@ function App() {
       window.removeEventListener("pointermove", handlePointerMove);
       window.removeEventListener("pointerup", handlePointerUp);
     };
-  }, [isDraggingDial]);
+  }, [isDraggingDial, seekTo, updateTimeFromPointer]);
 
   // ── Crowd Drop Pointer Events ──
   useEffect(() => {
@@ -782,18 +974,35 @@ function App() {
         const dropPoint = [e.clientX, e.clientY] as [number, number];
         const lngLat = mapRef.current.unproject(dropPoint);
 
-        // Scatter the crowd into ~12 distinct clusters within a ~150m radius
-        // 0.0015 degrees lat/lon is roughly 150m.
+        // Scatter the crowd into 12 clusters inside a ~150 m circle.
         const drops = 12;
-        const peoplePerDrop = Math.floor(crowdSize / drops);
+        const basePerDrop = Math.floor(crowdSize / drops);
+        // Integer division loses up to `drops - 1` people; hand the remainder
+        // out so the count actually placed matches the number on the button.
+        let remainder = crowdSize - basePerDrop * drops;
 
         for (let i = 0; i < drops; i++) {
-          const r = Math.random() * 0.0015;
+          // sqrt makes the sample uniform over the disc rather than clustered
+          // at the center, and the longitude offset is divided by cos(lat) so
+          // the footprint is a circle rather than a 1.5:1 ellipse at 47.6 N.
+          const radius = CROWD_SCATTER_RADIUS_DEG * Math.sqrt(Math.random());
           const theta = Math.random() * 2 * Math.PI;
-          const lat = lngLat.lat + r * Math.cos(theta);
-          const lon = lngLat.lng + r * Math.sin(theta);
+          const lat = lngLat.lat + radius * Math.sin(theta);
+          const lon =
+            lngLat.lng +
+            (radius * Math.cos(theta)) /
+              Math.max(0.01, Math.cos((lngLat.lat * Math.PI) / 180));
 
-          addPeople(lat, lon, peoplePerDrop).catch(console.error);
+          const count = basePerDrop + (remainder > 0 ? 1 : 0);
+          if (remainder > 0) remainder -= 1;
+          if (count <= 0) continue;
+
+          addPeople(lat, lon, count, {
+            kind: "crowd",
+            duration_minutes: 240,
+          }).catch((err: unknown) => {
+            console.warn("[heatmap] failed to place part of a crowd", err);
+          });
         }
       }
     };
@@ -807,18 +1016,31 @@ function App() {
     };
   }, [isDraggingCrowd, crowdSize, addPeople]);
 
+  const backendIsPlayingRef = useRef(backendIsPlaying);
+  useEffect(() => {
+    backendIsPlayingRef.current = backendIsPlaying;
+  }, [backendIsPlaying]);
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.code === "Space") {
-        e.preventDefault();
-        setPlaying(!backendIsPlaying).catch((err) => {
-          console.warn("[heatmap] failed to update playback", err);
-        });
+      if (e.code !== "Space" || e.repeat) return;
+      // Space is the native activation key for buttons and range inputs.
+      const target = e.target as HTMLElement | null;
+      if (
+        target instanceof HTMLElement &&
+        (target.isContentEditable ||
+          ["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(target.tagName))
+      ) {
+        return;
       }
+      e.preventDefault();
+      setPlaying(!backendIsPlayingRef.current).catch((err) => {
+        console.warn("[heatmap] failed to update playback", err);
+      });
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [backendIsPlaying, setPlaying]);
+  }, [setPlaying]);
 
   const formatTime = (minutes: number) => {
     const hours = Math.floor(minutes / 60);
@@ -860,17 +1082,19 @@ function App() {
   // Interactive layer IDs for click detection
   const interactiveLayerIds = useMemo(
     () => [
+      ...(isHeatmapVisible ? [HEATMAP_LAYER_ID] : []),
       "transit-stops-circle",
       "transit-stops-dot",
       "deploy-pulse-ring",
       "deploy-glow-dot",
     ],
-    [],
+    [isHeatmapVisible],
   );
 
   const handleMapLoad = useCallback(
     (event: { target: MapLibreMap }) => {
       applyBasemapPalette(event.target);
+      setIsMapLoaded(true);
 
       if (mapRef.current) {
         updateBuildingsForViewport(mapRef.current);
@@ -879,8 +1103,33 @@ function App() {
     [],
   );
 
+  const initialBuildingRegionLoaded = Boolean(
+    regionCollections[REGION_LOAD_ORDER[0]] || regionErrors[REGION_LOAD_ORDER[0]],
+  );
+  const initialHeatmapStreamLoaded = Boolean(
+    heatmapDiagnostics.config &&
+      heatmapDiagnostics.confirmedScenarioId &&
+      heatmapDiagnostics.lastFrameAt &&
+      playback,
+  );
+  const isAppReady =
+    isMapLoaded && initialBuildingRegionLoaded && initialHeatmapStreamLoaded;
+  // The stream retries forever on its own, so without an explicit failure state
+  // an unreachable backend leaves a fully-loaded map hidden behind a spinner.
+  const streamUnreachable =
+    heatmapDiagnostics.connection === "failed" && !initialHeatmapStreamLoaded;
+  const loadingStatus = streamUnreachable
+    ? "Can't reach the simulation server"
+    : !isMapLoaded
+      ? "Loading map"
+      : !initialBuildingRegionLoaded
+        ? "Loading city model"
+        : !initialHeatmapStreamLoaded
+          ? "Syncing simulator"
+          : "Ready";
+
   return (
-    <div className="map-shell">
+    <div className={`map-shell ${isAppReady ? "is-ready" : "is-loading"}`}>
       <Map
         ref={mapRef}
         initialViewState={initialViewState}
@@ -888,13 +1137,17 @@ function App() {
         style={{ width: "100vw", height: "100vh" }}
         onClick={handleMapClick}
         onMove={handleMapMove}
+        onMouseMove={handleMapMouseMove}
+        onMouseLeave={() => setDemandTooltip(null)}
         onLoad={handleMapLoad}
         onMoveEnd={(event) =>
           updateBuildingsForViewport(event.target as unknown as MapRef)
         }
         interactiveLayerIds={interactiveLayerIds}
-        cursor={nextStep ? "pointer" : undefined}
+        cursor={demandTooltip || nextStep ? "pointer" : undefined}
+        maxBounds={cameraMaxBounds}
         maxPitch={isPitchLocked ? 0 : 85}
+        renderWorldCopies={false}
       >
         <NavigationControl position="top-right" />
 
@@ -908,6 +1161,26 @@ function App() {
           }
         >
           {viewMode === "angled" ? "2D" : "3D"}
+        </button>
+
+        <button
+          className={`heatmap-toggle-button ${isHeatmapVisible ? "is-active" : ""}`}
+          onClick={() => {
+            if (isHeatmapVisible) {
+              setDemandTooltip(null);
+            }
+            setIsHeatmapVisible((current) => !current);
+          }}
+          type="button"
+          aria-label={isHeatmapVisible ? "Hide heatmap" : "Show heatmap"}
+          aria-pressed={isHeatmapVisible}
+          title={isHeatmapVisible ? "Hide heatmap" : "Show heatmap"}
+        >
+          <span className="heatmap-toggle-icon" aria-hidden="true">
+            <span />
+            <span />
+            <span />
+          </span>
         </button>
 
         <div className="crowd-drop-control">
@@ -935,19 +1208,32 @@ function App() {
           </div>
         </div>
 
-        <Source id="official-seattle-buildings" type="geojson" data={buildings}>
-          <Layer beforeId="watername_ocean" {...buildingFillLayer} />
-        </Source>
+        {loadedRegions.map(([regionId, collection]) => (
+          <Source
+            key={regionId}
+            id={`official-seattle-buildings-${regionId}`}
+            type="geojson"
+            data={collection}
+          >
+            <Layer
+              beforeId="watername_ocean"
+              {...buildingFillLayer}
+              id={`official-seattle-buildings-fill-${regionId}`}
+            />
+          </Source>
+        ))}
 
         <DeckGLOverlay
           interleaved={true}
-          effects={[lightingEffect]}
+          effects={deckEffects}
           layers={deckLayers}
         />
 
-        <Source id="heatmap-source" type="geojson" data={heatmapData}>
-          <Layer {...heatmapLayer} />
-        </Source>
+        {isHeatmapVisible && (
+          <Source id="heatmap-source" type="geojson" data={heatmapData}>
+            <Layer {...heatmapLayer} />
+          </Source>
+        )}
 
         <Source id="transit-lines" type="geojson" data={linesGeoJSON}>
           <Layer {...lineCasingLayer} />
@@ -974,27 +1260,66 @@ function App() {
             anchor="bottom"
             offset={[0, -30]}
           >
-            <div className="deploy-tooltip">
+            <button
+              className="deploy-tooltip"
+              onClick={(event) => {
+                event.stopPropagation();
+                deployNextStep();
+              }}
+              type="button"
+            >
               <span className="deploy-tooltip-icon">⚡</span>
               <span>{nextStep.label}</span>
-            </div>
+            </button>
           </Marker>
         )}
       </Map>
 
+      {demandTooltip && (
+        <div
+          className="demand-tooltip"
+          style={{
+            left: `${demandTooltip.x}px`,
+            top: `${demandTooltip.y}px`,
+          }}
+        >
+          <div className="demand-tooltip-header">
+            <span>Transit Demand</span>
+            <strong>{demandTooltip.pressureLabel}</strong>
+          </div>
+          <div className="demand-index-row">
+            <span>Index</span>
+            <strong>{demandTooltip.demandIndex}</strong>
+          </div>
+          <div className="demand-meter" aria-hidden="true">
+            <span style={{ width: `${demandTooltip.demandIndex}%` }} />
+          </div>
+          <div className="demand-tooltip-grid">
+            <span>Est. trips/hr</span>
+            <strong>
+              {formatDemandNumber(demandTooltip.estimatedTripsPerHour)}
+            </strong>
+            <span>Density</span>
+            <strong>{demandTooltip.density.toFixed(2)}</strong>
+          </div>
+        </div>
+      )}
+
       {/* Off-screen arrow pointing toward the deploy node */}
       {offscreenArrow && nextStep?.label && (
-        <div
+        <button
           className="offscreen-arrow"
+          onClick={deployNextStep}
           style={{
             left: `${offscreenArrow.x}px`,
             top: `${offscreenArrow.y}px`,
             transform: `translate(-50%, -50%) rotate(${offscreenArrow.angle}deg)`,
           }}
+          type="button"
         >
           <span className="offscreen-arrow-label">{nextStep.label}</span>
           <span className="offscreen-arrow-chevron">›</span>
-        </div>
+        </button>
       )}
 
       {/* Dragging Reticle */}
@@ -1153,6 +1478,43 @@ function App() {
               </button>
             </div>
           </div>
+        </div>
+      </div>
+
+      <div
+        className={`app-loading-screen ${isAppReady ? "is-complete" : ""} ${
+          streamUnreachable ? "has-error" : ""
+        }`}
+        aria-hidden={isAppReady}
+      >
+        <div className="app-loading-panel">
+          <div className="loading-kicker">Gridlock</div>
+          <div className="loading-title">Seattle Transit Sim</div>
+          <div className="loading-status">{loadingStatus}</div>
+          {streamUnreachable ? (
+            <>
+              <p className="loading-detail">
+                {heatmapDiagnostics.lastError ??
+                  "The simulation backend is not responding."}
+              </p>
+              <button
+                type="button"
+                className="loading-retry"
+                onClick={retryConnection}
+              >
+                Retry connection
+              </button>
+            </>
+          ) : (
+            <>
+              <div className="loading-track" aria-hidden="true" />
+              <div className="loading-steps" aria-hidden="true">
+                <span className={isMapLoaded ? "is-done" : ""} />
+                <span className={initialBuildingRegionLoaded ? "is-done" : ""} />
+                <span className={initialHeatmapStreamLoaded ? "is-done" : ""} />
+              </div>
+            </>
+          )}
         </div>
       </div>
     </div>

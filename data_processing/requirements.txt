@@ -1,8 +1,9 @@
-pandas
-requests
-shapely
-scikit-learn
-geopandas
-pyogrio
-fastapi
-uvicorn
+# Offline data-processing pipelines only. Nothing here is imported at runtime
+# by backend/ or the frontend; see CLAUDE.md.
+pandas>=2.0,<3.0
+numpy>=1.24,<3.0
+requests>=2.31,<3.0
+shapely>=2.0,<3.0
+geopandas>=1.0,<2.0
+# geopandas I/O engine (read_file/to_file); used via geopandas, never imported directly.
+pyogrio>=0.8,<1.0

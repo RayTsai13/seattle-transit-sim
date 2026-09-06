@@ -17,9 +17,13 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR / "data_processing") not in sys.path:
     sys.path.append(str(ROOT_DIR / "data_processing"))
 
-from src.geo_utils import compute_population_density_vectors
-from src.io_utils import cached_download, ensure_dir, write_csv
-from src.station_utils import add_rank_and_scores, aggregate_duplicate_stations, read_gtfs_stops
+from src.common.geo_utils import compute_population_density_vectors
+from src.common.io_utils import cached_download, ensure_dir, write_csv
+from src.common.station_utils import (
+    add_rank_and_scores,
+    aggregate_duplicate_stations,
+    read_gtfs_stops,
+)
 
 
 SEATTLE_BBOX = (-122.4597, 47.4810, -122.2244, 47.7340)
@@ -31,7 +35,11 @@ ACS_URL = f"https://api.census.gov/data/{ACS_YEAR}/acs/acs5"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Create Seattle station vectors.")
-    parser.add_argument("--gtfs-dir", default="gtfs", help="Local Seattle/Puget Sound GTFS directory.")
+    parser.add_argument(
+        "--gtfs-dir",
+        default="data_processing/gtfs",
+        help="Local Seattle/Puget Sound GTFS directory, relative to the repo root.",
+    )
     parser.add_argument("--raw-dir", default="../data/raw", help="Raw data cache directory.")
     parser.add_argument("--out-dir", default="../data/processed", help="Output directory.")
     parser.add_argument("--radius-m", type=int, default=1000, help="Station population radius.")
@@ -136,6 +144,11 @@ def main() -> None:
     gtfs_dir = Path(args.gtfs_dir)
     if not gtfs_dir.is_absolute():
         gtfs_dir = (ROOT_DIR / gtfs_dir).resolve()
+    if not gtfs_dir.is_dir():
+        raise SystemExit(
+            f"GTFS directory not found: {gtfs_dir}. Pass --gtfs-dir, or run "
+            "data_processing/scripts/download_raw_data.py first."
+        )
 
     stations = build_gtfs_connectivity(gtfs_dir)
     tracts, seattle_boundary, seattle_population = load_population_geometries(raw_dir)

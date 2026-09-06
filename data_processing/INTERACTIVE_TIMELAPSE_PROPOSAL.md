@@ -1,5 +1,13 @@
 # Interactive Demand Timelapse Proposal
 
+> **Historical design record.** The model pipeline described below has been
+> removed from the repository: `src/models/`, `src/pipelines/delhi/prepare_train_test.py`,
+> `scripts/train_models.py`, `scripts/build_line_weights.py`, and
+> `scripts/test_scenarios.py` no longer exist, and `scikit-learn` is no longer a
+> dependency. The runtime backend (`backend/`) generates demand analytically from
+> the land-use model in `backend/landuse.py` and never consumed these outputs.
+> This document is kept for the reasoning and feature definitions it captures.
+
 This proposal describes how the demand heatmap should evolve for a looping frontend timelapse where users can add stations, lines, frequency changes, and events, then immediately see how demand changes over time.
 
 ## Goal
